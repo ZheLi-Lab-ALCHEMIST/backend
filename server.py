@@ -2,6 +2,8 @@ import os
 import sys
 import asyncio
 import traceback
+import copy
+import inspect
 
 import nodes
 import folder_paths
@@ -21,6 +23,7 @@ from io import BytesIO
 import aiohttp
 from aiohttp import web
 import logging
+from dataclasses import dataclass
 
 import mimetypes
 from comfy.cli_args import args
@@ -36,9 +39,25 @@ from app.user_manager import UserManager
 from app.model_manager import ModelFileManager
 from app.custom_node_manager import CustomNodeManager
 from app.subgraph_manager import SubgraphManager
-from typing import Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 from api_server.routes.internal.internal_routes import InternalRoutes
 from protocol import BinaryEventTypes
+
+
+DEFAULT_HISTORY_PROVIDER_TIMEOUT = 0.5
+
+
+@dataclass
+class PromptSubmitContext:
+    request: web.Request
+    original_json: Dict[str, Any]
+    prompt: Dict[str, Any]
+    prompt_id: str
+    number: float
+    outputs_to_execute: Optional[List[str]]
+    extra_data: Dict[str, Any]
+    client_id: Optional[str]
+    partial_execution_targets: Optional[List[str]]
 
 # Import cache control middleware
 from middleware.cache_middleware import cache_control
@@ -208,6 +227,9 @@ class PromptServer():
         self.client_id = None
 
         self.on_prompt_handlers = []
+        self.on_prompt_submit_handlers: List[Callable[[PromptSubmitContext], Awaitable[Optional[web.StreamResponse]]]] = []
+        self.history_providers: List[Callable[[Optional[str], Optional[int]], Awaitable[Optional[Dict[str, Any]]]]] = []
+        self.history_provider_timeout = DEFAULT_HISTORY_PROVIDER_TIMEOUT
 
         @routes.get('/ws')
         async def websocket_handler(request):
@@ -670,9 +692,17 @@ class PromptServer():
 
         @routes.get("/history")
         async def get_history(request):
-            max_items = request.rel_url.query.get("max_items", None)
-            if max_items is not None:
-                max_items = int(max_items)
+            max_items_param = request.rel_url.query.get("max_items")
+            max_items: Optional[int] = None
+            if max_items_param is not None:
+                try:
+                    max_items = int(max_items_param)
+                except ValueError:
+                    return web.Response(status=400, text="max_items must be an integer")
+
+            provider_history = await self.query_history(None, max_items)
+            if provider_history is not None:
+                return web.json_response(provider_history)
 
             offset = request.rel_url.query.get("offset", None)
             if offset is not None:
@@ -685,7 +715,19 @@ class PromptServer():
         @routes.get("/history/{prompt_id}")
         async def get_history_prompt_id(request):
             prompt_id = request.match_info.get("prompt_id", None)
-            return web.json_response(self.prompt_queue.get_history(prompt_id=prompt_id))
+            max_items_param = request.rel_url.query.get("max_items")
+            max_items: Optional[int] = None
+            if max_items_param is not None:
+                try:
+                    max_items = int(max_items_param)
+                except ValueError:
+                    return web.Response(status=400, text="max_items must be an integer")
+
+            provider_history = await self.query_history(prompt_id, max_items)
+            if provider_history is not None:
+                return web.json_response(provider_history)
+
+            return web.json_response(self.prompt_queue.get_history(prompt_id=prompt_id, max_items=max_items))
 
         @routes.get("/queue")
         async def get_queue(request):
@@ -720,14 +762,35 @@ class PromptServer():
                     partial_execution_targets = json_data["partial_execution_targets"]
 
                 valid = await execution.validate_prompt(prompt_id, prompt, partial_execution_targets)
-                extra_data = {}
+                extra_data: Dict[str, Any] = {}
                 if "extra_data" in json_data:
                     extra_data = json_data["extra_data"]
+                    if not isinstance(extra_data, dict):
+                        logging.warning("[ALCHEM] extra_data payload is not a dict; resetting to empty")
+                        extra_data = {}
 
                 if "client_id" in json_data:
                     extra_data["client_id"] = json_data["client_id"]
                 if valid[0]:
                     outputs_to_execute = valid[2]
+                    context = PromptSubmitContext(
+                        request=request,
+                        original_json=copy.deepcopy(json_data),
+                        prompt=prompt,
+                        prompt_id=prompt_id,
+                        number=number,
+                        outputs_to_execute=outputs_to_execute,
+                        extra_data=extra_data,
+                        client_id=json_data.get("client_id"),
+                        partial_execution_targets=partial_execution_targets,
+                    )
+                    try:
+                        hook_response = await self.trigger_on_prompt_submit(context)
+                    except asyncio.CancelledError:
+                        raise
+                    if hook_response is not None:
+                        return hook_response
+
                     self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute))
                     response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
                     return web.json_response(response)
@@ -1016,6 +1079,269 @@ class PromptServer():
 
         if call_on_start is not None:
             call_on_start(scheme, self.address, self.port)
+
+    def add_on_prompt_submit_handler(
+        self,
+        handler: Callable[[PromptSubmitContext], Awaitable[Optional[web.StreamResponse]]],
+    ) -> None:
+        self.on_prompt_submit_handlers.append(handler)
+
+    async def trigger_on_prompt_submit(
+        self, ctx: PromptSubmitContext
+    ) -> Optional[web.StreamResponse]:
+        if not self.on_prompt_submit_handlers:
+            return None
+
+        for handler in list(self.on_prompt_submit_handlers):
+            try:
+                result = handler(ctx)
+                if inspect.isawaitable(result):
+                    result = await result
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.error(
+                    "[ALCHEM] on_prompt_submit handler %s raised an exception; falling back to core queue",
+                    getattr(handler, "__name__", repr(handler)),
+                    exc_info=True,
+                )
+                continue
+
+            if result is None:
+                continue
+
+            if not isinstance(result, web.StreamResponse):
+                logging.warning(
+                    "[ALCHEM] on_prompt_submit handler %s returned unsupported response type %s; ignoring",
+                    getattr(handler, "__name__", repr(handler)),
+                    type(result),
+                )
+                continue
+
+            logging.info(
+                "[ALCHEM] prompt submission short-circuited by handler %s",
+                getattr(handler, "__name__", repr(handler)),
+            )
+            return result
+
+        return None
+
+    def add_history_provider(
+        self,
+        provider: Callable[[Optional[str], Optional[int]], Awaitable[Optional[Dict[str, Any]]]],
+    ) -> None:
+        self.history_providers.append(provider)
+
+    def set_history_provider_timeout(self, timeout: Optional[float]) -> None:
+        if timeout is None:
+            self.history_provider_timeout = None
+            return
+
+        try:
+            timeout_value = float(timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("history provider timeout must be a positive float or None") from exc
+
+        if timeout_value <= 0:
+            raise ValueError("history provider timeout must be greater than zero")
+
+        self.history_provider_timeout = timeout_value
+
+    async def query_history(
+        self, prompt_id: Optional[str], max_items: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        if not self.history_providers:
+            return None
+
+        task_to_provider: Dict[asyncio.Task[Optional[Dict[str, Any]]], Callable[[Optional[str], Optional[int]], Awaitable[Optional[Dict[str, Any]]]]] = {}
+        tasks: List[asyncio.Task[Optional[Dict[str, Any]]]] = []
+        for provider in list(self.history_providers):
+            task = asyncio.create_task(
+                self._invoke_history_provider_with_timeout(provider, prompt_id, max_items)
+            )
+            task_to_provider[task] = provider
+            tasks.append(task)
+
+        aggregated: Optional[Dict[str, Any]] = None
+        if not tasks:
+            return None
+
+        for completed in asyncio.as_completed(tasks):
+            provider = task_to_provider.get(completed)
+            try:
+                payload = await completed
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.error(
+                    "[ALCHEM] history provider %s raised an unexpected exception",
+                    self._history_provider_display_name(provider),
+                    exc_info=True,
+                )
+                continue
+
+            if payload is None:
+                continue
+
+            if aggregated is None:
+                aggregated = copy.deepcopy(payload)
+                continue
+
+            self._merge_history_payload(aggregated, payload, prompt_id)
+
+        for task in tasks:
+            task_to_provider.pop(task, None)
+
+        if aggregated is None:
+            return None
+
+        self._apply_history_max_items(aggregated, prompt_id, max_items)
+        logging.debug(
+            "[ALCHEM] history aggregated via providers: prompt_id=%s, max_items=%s",
+            prompt_id,
+            max_items,
+        )
+        return aggregated
+
+    async def _invoke_history_provider_with_timeout(
+        self,
+        provider: Callable[[Optional[str], Optional[int]], Awaitable[Optional[Dict[str, Any]]]],
+        prompt_id: Optional[str],
+        max_items: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        timeout = getattr(self, "history_provider_timeout", None)
+        name = self._history_provider_display_name(provider)
+        try:
+            if timeout is None or timeout <= 0:
+                return await self._invoke_history_provider(provider, prompt_id, max_items, name)
+            return await asyncio.wait_for(
+                self._invoke_history_provider(provider, prompt_id, max_items, name),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logging.warning(
+                "[ALCHEM] history provider %s timed out after %.2fs",
+                name,
+                timeout,
+            )
+            return None
+
+    async def _invoke_history_provider(
+        self,
+        provider: Callable[[Optional[str], Optional[int]], Awaitable[Optional[Dict[str, Any]]]],
+        prompt_id: Optional[str],
+        max_items: Optional[int],
+        provider_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            payload = provider(prompt_id, max_items)
+            if inspect.isawaitable(payload):
+                payload = await payload
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.error(
+                "[ALCHEM] history provider %s raised an exception",
+                provider_name,
+                exc_info=True,
+            )
+            return None
+
+        return self._normalize_history_payload(payload, prompt_id, provider_name)
+
+    def _normalize_history_payload(
+        self,
+        payload: Optional[Dict[str, Any]],
+        prompt_id: Optional[str],
+        provider_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        if payload is None:
+            return None
+
+        if not isinstance(payload, dict):
+            logging.warning(
+                "[ALCHEM] history provider %s returned non-dict payload %s",
+                provider_name,
+                type(payload),
+            )
+            return None
+
+        if prompt_id is not None and prompt_id not in payload:
+            # 允许 Provider 直接返回单条历史结构，自动包裹 prompt_id
+            payload = {prompt_id: payload}
+
+        return payload
+
+    def _merge_history_payload(
+        self,
+        base: Dict[str, Any],
+        extra: Dict[str, Any],
+        prompt_id: Optional[str],
+    ) -> None:
+        for key, value in extra.items():
+            if key not in base:
+                base[key] = value
+                continue
+
+            if isinstance(base[key], dict) and isinstance(value, dict):
+                self._merge_history_entry(base[key], value)
+
+    def _merge_history_entry(self, base_entry: Dict[str, Any], new_entry: Dict[str, Any]) -> None:
+        base_outputs = base_entry.get("outputs")
+        new_outputs = new_entry.get("outputs")
+
+        if isinstance(base_outputs, list) and isinstance(new_outputs, list):
+            base_entry["outputs"] = base_outputs + [item for item in new_outputs if item not in base_outputs]
+        elif isinstance(base_outputs, dict) and isinstance(new_outputs, dict):
+            for output_key, output_value in new_outputs.items():
+                base_outputs.setdefault(output_key, output_value)
+        elif base_outputs is None and new_outputs is not None:
+            base_entry["outputs"] = new_outputs
+
+        base_meta = base_entry.get("meta")
+        new_meta = new_entry.get("meta")
+        if isinstance(new_meta, dict):
+            if not isinstance(base_meta, dict):
+                base_entry["meta"] = dict(new_meta)
+            else:
+                for meta_key, meta_value in new_meta.items():
+                    base_meta.setdefault(meta_key, meta_value)
+
+        if "status" not in base_entry and "status" in new_entry:
+            base_entry["status"] = new_entry["status"]
+
+    def _apply_history_max_items(
+        self,
+        payload: Dict[str, Any],
+        prompt_id: Optional[str],
+        max_items: Optional[int],
+    ) -> None:
+        if max_items is None or max_items < 0:
+            return
+
+        if prompt_id is None:
+            keys = list(payload.keys())
+            for stale_key in keys[max_items:]:
+                payload.pop(stale_key, None)
+            return
+
+        if not payload:
+            return
+
+        entry = next(iter(payload.values()))
+        outputs = entry.get("outputs")
+        if isinstance(outputs, list):
+            entry["outputs"] = outputs[:max_items]
+        elif isinstance(outputs, dict):
+            output_keys = list(outputs.keys())
+            for stale_key in output_keys[max_items:]:
+                outputs.pop(stale_key, None)
+
+    @staticmethod
+    def _history_provider_display_name(
+        provider: Callable[[Optional[str], Optional[int]], Awaitable[Optional[Dict[str, Any]]]]
+    ) -> str:
+        return getattr(provider, "__name__", provider.__class__.__name__)
 
     def add_on_prompt_handler(self, handler):
         self.on_prompt_handlers.append(handler)
