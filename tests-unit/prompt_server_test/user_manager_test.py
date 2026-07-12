@@ -2,6 +2,7 @@ import pytest
 import pytest_asyncio
 import hashlib
 import os
+from pathlib import Path
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from app.user_manager import UserManager, _canonical_json_text, _result_matches_request
@@ -907,6 +908,103 @@ async def test_disposition_routes_project_closed_results(aiohttp_client, app, us
         "example.json"
     )
     assert acknowledged.status == 204
+
+
+@pytest_asyncio.fixture
+async def exact_pm_project_instance_routes(tmp_path, user_manager, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "custom_nodes"))
+    from ALCHEM_project_manager.adapters.comfyui_userdata_hook import (
+        ComfyUIUserdataHookAdapter,
+    )
+    from ALCHEM_project_manager.core.project_manager import ProjectManager
+    from ALCHEM_project_manager.core.workflow_engine import WorkflowEngine
+
+    defaults = tmp_path / "defaults.json"
+    defaults.write_text('{"ui":{"theme":"light"}}\n', encoding="utf-8")
+    manager = ProjectManager(
+        defaults_path=defaults,
+        metadata_registry_root=tmp_path / "registry",
+    )
+    target_root = Path(manager.create_project("target-project", tmp_path)["project_path"])
+    engine = WorkflowEngine(project_manager=manager)
+    target_instance_id = manager.get_context_snapshot()["project_instance_id"]
+    created = await engine.execute(
+        operation="write",
+        write_mode="create",
+        source_storage_key="workflows/example.json",
+        destination_storage_key="workflows/example.json",
+        raw_body=WORKFLOW_BODY,
+        mutation_request_id=HEX_A,
+        project_instance_id=target_instance_id,
+        workflow_id=None,
+        expected_workflow_revision=None,
+        expected_before_fingerprint=None,
+        expected_destination_absent=True,
+        after_content_fingerprint=BODY_FINGERPRINT,
+    )
+    assert created["status"] == "committed"
+
+    stale_root = Path(
+        manager.create_project("unrelated-stale-project", tmp_path)["project_path"]
+    )
+    stale_instance_id = manager.get_context_snapshot()["project_instance_id"]
+    manager.open_project(target_root, emit_event=False)
+    (stale_root / ".alchem" / "metadata.json").unlink()
+
+    adapter = ComfyUIUserdataHookAdapter()
+    adapter.bind_workflow_mutation_transaction_provider(user_manager, engine)
+    try:
+        yield target_instance_id, stale_instance_id, created
+    finally:
+        adapter.clear_runtime_bindings()
+
+
+async def test_disposition_routes_exact_pm_resolver_ignores_unrelated_stale_registry(
+    aiohttp_client, app, exact_pm_project_instance_routes
+):
+    target_instance_id, _stale_instance_id, created = exact_pm_project_instance_routes
+    client = await aiohttp_client(app)
+
+    identities = await client.get(
+        f"/userdata/workflow-identities?project_instance_id={target_instance_id}"
+    )
+    fetched = await client.get(
+        f"/userdata/mutation-disposition/{HEX_A}"
+        f"?project_instance_id={target_instance_id}"
+    )
+    listed = await client.get(
+        f"/userdata/mutation-dispositions?project_instance_id={target_instance_id}"
+    )
+
+    assert identities.status == fetched.status == listed.status == 200
+    identity_body = await identities.json()
+    assert identity_body["project_instance_id"] == target_instance_id
+    assert identity_body["identities"][0]["workflow_id"] == created["workflow_id"]
+    assert await fetched.json() == created
+    assert await listed.json() == {
+        "project_instance_id": target_instance_id,
+        "results": [created],
+    }
+
+
+async def test_disposition_routes_exact_pm_resolver_rejects_requested_stale_registry(
+    aiohttp_client, app, exact_pm_project_instance_routes
+):
+    _target_instance_id, stale_instance_id, _created = exact_pm_project_instance_routes
+    client = await aiohttp_client(app)
+    routes = (
+        f"/userdata/workflow-identities?project_instance_id={stale_instance_id}",
+        f"/userdata/mutation-disposition/{HEX_B}?project_instance_id={stale_instance_id}",
+        f"/userdata/mutation-dispositions?project_instance_id={stale_instance_id}",
+    )
+
+    for route in routes:
+        response = await client.get(route)
+        body = await response.json()
+        assert response.status == 503
+        assert body["status"] == "rejected"
+        assert body["project_instance_id"] == stale_instance_id
+        assert body["reason"] == "project_context_unavailable"
 
 
 async def test_get_disposition_rejects_mismatched_result_correlation(
