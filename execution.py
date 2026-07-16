@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import traceback
+from contextvars import ContextVar
 from enum import Enum
 from typing import List, Literal, NamedTuple, Optional, Union
 import asyncio
@@ -34,6 +35,14 @@ from comfy_execution.progress import get_progress_state, reset_progress_state, a
 from comfy_execution.utils import CurrentNodeContext
 from comfy_api.internal import _ComfyNodeInternal, _NodeOutputInternal, first_real_override, is_class, make_locked_method_func
 from comfy_api.latest import io
+
+
+_current_prompt_sidecar = ContextVar("current_prompt_sidecar", default=None)
+_current_prompt_node_id = ContextVar("current_prompt_node_id", default=None)
+
+
+def get_current_prompt_execution_context():
+    return _current_prompt_sidecar.get(), _current_prompt_node_id.get()
 
 
 class ExecutionResult(Enum):
@@ -263,8 +272,12 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
                 f = getattr(obj, func)
             if inspect.iscoroutinefunction(f):
                 async def async_wrapper(f, prompt_id, unique_id, list_index, args):
-                    with CurrentNodeContext(prompt_id, unique_id, list_index):
-                        return await f(**args)
+                    token = _current_prompt_node_id.set(unique_id)
+                    try:
+                        with CurrentNodeContext(prompt_id, unique_id, list_index):
+                            return await f(**args)
+                    finally:
+                        _current_prompt_node_id.reset(token)
                 task = asyncio.create_task(async_wrapper(f, prompt_id, unique_id, index, args=inputs))
                 # Give the task a chance to execute without yielding
                 await asyncio.sleep(0)
@@ -274,8 +287,12 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
                 else:
                     results.append(task)
             else:
-                with CurrentNodeContext(prompt_id, unique_id, index):
-                    result = f(**inputs)
+                token = _current_prompt_node_id.set(unique_id)
+                try:
+                    with CurrentNodeContext(prompt_id, unique_id, index):
+                        result = f(**inputs)
+                finally:
+                    _current_prompt_node_id.reset(token)
                 results.append(result)
         else:
             results.append(execution_block)
@@ -655,6 +672,10 @@ class PromptExecutor:
         asyncio.run(self.execute_async(prompt, prompt_id, extra_data, execute_outputs))
 
     async def execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+        _current_prompt_sidecar.set(
+            self.server.prompt_queue.get_workbench_sidecar(prompt_id)
+        )
+        _current_prompt_node_id.set(None)
         nodes.interrupt_processing(False)
 
         if "client_id" in extra_data:
@@ -1088,6 +1109,7 @@ class PromptQueue:
         self.task_counter = 0
         self.queue = []
         self.currently_running = {}
+        self.workbench_sidecars = {}
         self.history = {}
         self.flags = {}
 
@@ -1097,6 +1119,30 @@ class PromptQueue:
             self.server.queue_updated()
             self.not_empty.notify()
 
+    def put_with_workbench_sidecar(self, item, sidecar):
+        prompt_id = item[1]
+        with self.mutex:
+            if prompt_id in self.workbench_sidecars:
+                raise RuntimeError("Workbench prompt sidecar already exists")
+            self.workbench_sidecars[prompt_id] = sidecar
+            inserted = False
+            try:
+                heapq.heappush(self.queue, item)
+                inserted = True
+                sidecar.queue_committed()
+                self.server.queue_updated()
+                self.not_empty.notify()
+            except Exception:
+                if inserted:
+                    for index, queued_item in enumerate(self.queue):
+                        if queued_item is item:
+                            self.queue.pop(index)
+                            heapq.heapify(self.queue)
+                            break
+                self.workbench_sidecars.pop(prompt_id, None)
+                sidecar.terminalize("queue_insertion_rollback")
+                raise
+
     def get(self, timeout=None):
         with self.not_empty:
             while len(self.queue) == 0:
@@ -1104,6 +1150,13 @@ class PromptQueue:
                 if timeout is not None and len(self.queue) == 0:
                     return None
             item = heapq.heappop(self.queue)
+            sidecar = self.workbench_sidecars.get(item[1])
+            if sidecar is not None:
+                try:
+                    sidecar.mark_running()
+                except Exception:
+                    heapq.heappush(self.queue, item)
+                    raise
             i = self.task_counter
             self.currently_running[i] = copy.deepcopy(item)
             self.task_counter += 1
@@ -1119,25 +1172,31 @@ class PromptQueue:
                   status: Optional['PromptQueue.ExecutionStatus']):
         with self.mutex:
             prompt = self.currently_running.pop(item_id)
-            if len(self.history) > MAXIMUM_HISTORY_SIZE:
-                self.history.pop(next(iter(self.history)))
+            sidecar = self.workbench_sidecars.pop(prompt[1], None)
+            try:
+                if len(self.history) > MAXIMUM_HISTORY_SIZE:
+                    self.history.pop(next(iter(self.history)))
 
-            status_dict: Optional[dict] = None
-            if status is not None:
-                status_dict = copy.deepcopy(status._asdict())
+                status_dict: Optional[dict] = None
+                if status is not None:
+                    status_dict = copy.deepcopy(status._asdict())
 
-            # Remove sensitive data from extra_data before storing in history
-            for sensitive_val in SENSITIVE_EXTRA_DATA_KEYS:
-                if sensitive_val in prompt[3]:
-                    prompt[3].pop(sensitive_val)
+                # Remove sensitive data from extra_data before storing in history
+                for sensitive_val in SENSITIVE_EXTRA_DATA_KEYS:
+                    if sensitive_val in prompt[3]:
+                        prompt[3].pop(sensitive_val)
 
-            self.history[prompt[1]] = {
-                "prompt": prompt,
-                "outputs": {},
-                'status': status_dict,
-            }
-            self.history[prompt[1]].update(history_result)
-            self.server.queue_updated()
+                self.history[prompt[1]] = {
+                    "prompt": prompt,
+                    "outputs": {},
+                    'status': status_dict,
+                }
+                self.history[prompt[1]].update(history_result)
+                self.server.queue_updated()
+            finally:
+                if sidecar is not None:
+                    reason = "execution_success" if status and status.completed else "execution_fault"
+                    sidecar.terminalize(reason)
 
     # Note: slow
     def get_current_queue(self):
@@ -1160,21 +1219,45 @@ class PromptQueue:
 
     def wipe_queue(self):
         with self.mutex:
+            queued = self.queue
             self.queue = []
+            for item in queued:
+                sidecar = self.workbench_sidecars.pop(item[1], None)
+                if sidecar is not None:
+                    sidecar.terminalize("queue_wiped")
             self.server.queue_updated()
 
     def delete_queue_item(self, function):
         with self.mutex:
             for x in range(len(self.queue)):
                 if function(self.queue[x]):
-                    if len(self.queue) == 1:
-                        self.wipe_queue()
-                    else:
-                        self.queue.pop(x)
-                        heapq.heapify(self.queue)
+                    item = self.queue.pop(x)
+                    heapq.heapify(self.queue)
+                    sidecar = self.workbench_sidecars.pop(item[1], None)
+                    if sidecar is not None:
+                        sidecar.terminalize("queue_deleted")
                     self.server.queue_updated()
                     return True
         return False
+
+    def interrupt_running(self, prompt_id, interrupt_callback):
+        with self.mutex:
+            affected = [
+                item for item in self.currently_running.values()
+                if prompt_id is None or item[1] == prompt_id
+            ]
+            if prompt_id is not None and not affected:
+                return False
+            for item in affected:
+                sidecar = self.workbench_sidecars.get(item[1])
+                if sidecar is not None:
+                    sidecar.mark_cancelled()
+            interrupt_callback()
+            return True
+
+    def get_workbench_sidecar(self, prompt_id):
+        with self.mutex:
+            return self.workbench_sidecars.get(prompt_id)
 
     def get_history(self, prompt_id=None, max_items=None, offset=-1, map_function=None):
         with self.mutex:

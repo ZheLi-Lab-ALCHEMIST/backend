@@ -45,6 +45,20 @@ from protocol import BinaryEventTypes
 
 
 DEFAULT_HISTORY_PROVIDER_TIMEOUT = 0.5
+PROMPT_ADMISSION_FIELD = "prompt_enqueue_admission_id"
+
+
+class _DuplicateSocketJsonMember(ValueError):
+    pass
+
+
+def _reject_duplicate_socket_json_members(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateSocketJsonMember(key)
+        value[key] = item
+    return value
 
 
 @dataclass
@@ -215,6 +229,11 @@ class PromptServer():
         self.app = web.Application(client_max_size=max_upload_size, middlewares=middlewares)
         self.sockets = dict()
         self.sockets_metadata = dict()
+        self._socket_session_lock = asyncio.Lock()
+        self._socket_generation_counter = 0
+        self._socket_sessions: Dict[str, Dict[str, Any]] = {}
+        self._socket_message_handlers: Dict[str, Callable[..., Awaitable[None]]] = {}
+        self._socket_lifecycle_callbacks: List[Callable[[str, str, int], None]] = []
         self.web_root = (
             FrontendManager.init_frontend(args.front_end_version)
             if args.front_end_root is None
@@ -228,6 +247,7 @@ class PromptServer():
 
         self.on_prompt_handlers = []
         self.on_prompt_submit_handlers: List[Callable[[PromptSubmitContext], Awaitable[Optional[web.StreamResponse]]]] = []
+        self.prompt_admission_provider = None
         self.history_providers: List[Callable[[Optional[str], Optional[int]], Awaitable[Optional[Dict[str, Any]]]]] = []
         self.history_provider_timeout = DEFAULT_HISTORY_PROVIDER_TIMEOUT
 
@@ -236,59 +256,48 @@ class PromptServer():
             ws = web.WebSocketResponse()
             await ws.prepare(request)
             sid = request.rel_url.query.get('clientId', '')
-            if sid:
-                # Reusing existing session, remove old
-                self.sockets.pop(sid, None)
-            else:
+            if not sid:
                 sid = uuid.uuid4().hex
-
-            # Store WebSocket for backward compatibility
-            self.sockets[sid] = ws
-            # Store metadata separately
-            self.sockets_metadata[sid] = {"feature_flags": {}}
+            generation = await self._install_socket_generation(sid, ws)
 
             try:
                 # Send initial state to the new client
-                await self.send("status", {"status": self.get_queue_info(), "sid": sid}, sid)
+                initial_delivery = await self.send_json_exact(
+                    sid,
+                    generation,
+                    ws,
+                    "status",
+                    {"status": self.get_queue_info(), "sid": sid},
+                )
+                if initial_delivery != "delivered":
+                    return ws
                 # On reconnect if we are the currently executing client send the current node
                 if self.client_id == sid and self.last_node_id is not None:
-                    await self.send("executing", { "node": self.last_node_id }, sid)
-
-                # Flag to track if we've received the first message
-                first_message = True
+                    await self.send_json_exact(
+                        sid,
+                        generation,
+                        ws,
+                        "executing",
+                        {"node": self.last_node_id},
+                    )
 
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.ERROR:
                         logging.warning('ws connection closed with exception %s' % ws.exception())
                     elif msg.type == aiohttp.WSMsgType.TEXT:
                         try:
-                            data = json.loads(msg.data)
-                            # Check if first message is feature flags
-                            if first_message and data.get("type") == "feature_flags":
-                                # Store client feature flags
-                                client_flags = data.get("data", {})
-                                self.sockets_metadata[sid]["feature_flags"] = client_flags
-
-                                # Send server feature flags in response
-                                await self.send(
-                                    "feature_flags",
-                                    feature_flags.get_server_features(),
-                                    sid,
-                                )
-
-                                logging.debug(
-                                    f"Feature flags negotiated for client {sid}: {client_flags}"
-                                )
-                            first_message = False
-                        except json.JSONDecodeError:
-                            logging.warning(
-                                f"Invalid JSON received from client {sid}: {msg.data}"
+                            accepted = await self._handle_socket_text(
+                                sid, generation, ws, msg.data,
                             )
+                            if not accepted:
+                                await self.close_socket_generation(sid, generation, ws)
+                                break
                         except Exception as e:
                             logging.error(f"Error processing WebSocket message: {e}")
+                            await self.close_socket_generation(sid, generation, ws)
+                            break
             finally:
-                self.sockets.pop(sid, None)
-                self.sockets_metadata.pop(sid, None)
+                await self._remove_socket_generation(sid, generation, ws)
             return ws
 
         @routes.get("/")
@@ -739,72 +748,7 @@ class PromptServer():
 
         @routes.post("/prompt")
         async def post_prompt(request):
-            logging.info("got prompt")
-            json_data =  await request.json()
-            json_data = self.trigger_on_prompt(json_data)
-
-            if "number" in json_data:
-                number = float(json_data['number'])
-            else:
-                number = self.number
-                if "front" in json_data:
-                    if json_data['front']:
-                        number = -number
-
-                self.number += 1
-
-            if "prompt" in json_data:
-                prompt = json_data["prompt"]
-                prompt_id = str(json_data.get("prompt_id", uuid.uuid4()))
-
-                partial_execution_targets = None
-                if "partial_execution_targets" in json_data:
-                    partial_execution_targets = json_data["partial_execution_targets"]
-
-                valid = await execution.validate_prompt(prompt_id, prompt, partial_execution_targets)
-                extra_data: Dict[str, Any] = {}
-                if "extra_data" in json_data:
-                    extra_data = json_data["extra_data"]
-                    if not isinstance(extra_data, dict):
-                        logging.warning("[ALCHEM] extra_data payload is not a dict; resetting to empty")
-                        extra_data = {}
-
-                if "client_id" in json_data:
-                    extra_data["client_id"] = json_data["client_id"]
-                if valid[0]:
-                    outputs_to_execute = valid[2]
-                    context = PromptSubmitContext(
-                        request=request,
-                        original_json=copy.deepcopy(json_data),
-                        prompt=prompt,
-                        prompt_id=prompt_id,
-                        number=number,
-                        outputs_to_execute=outputs_to_execute,
-                        extra_data=extra_data,
-                        client_id=json_data.get("client_id"),
-                        partial_execution_targets=partial_execution_targets,
-                    )
-                    try:
-                        hook_response = await self.trigger_on_prompt_submit(context)
-                    except asyncio.CancelledError:
-                        raise
-                    if hook_response is not None:
-                        return hook_response
-
-                    self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute))
-                    response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
-                    return web.json_response(response)
-                else:
-                    logging.warning("invalid prompt: {}".format(valid[1]))
-                    return web.json_response({"error": valid[1], "node_errors": valid[3]}, status=400)
-            else:
-                error = {
-                    "type": "no_prompt",
-                    "message": "No prompt provided",
-                    "details": "No prompt provided",
-                    "extra_info": {}
-                }
-                return web.json_response({"error": error, "node_errors": {}}, status=400)
+            return await self._post_prompt(request)
 
         @routes.post("/queue")
         async def post_queue(request):
@@ -830,25 +774,17 @@ class PromptServer():
             # Check if a specific prompt_id was provided for targeted interruption
             prompt_id = json_data.get('prompt_id')
             if prompt_id:
-                currently_running, _ = self.prompt_queue.get_current_queue()
-
-                # Check if the prompt_id matches any currently running prompt
-                should_interrupt = False
-                for item in currently_running:
-                    # item structure: (number, prompt_id, prompt, extra_data, outputs_to_execute)
-                    if item[1] == prompt_id:
-                        logging.info(f"Interrupting prompt {prompt_id}")
-                        should_interrupt = True
-                        break
-
-                if should_interrupt:
-                    nodes.interrupt_processing()
+                interrupted = self.prompt_queue.interrupt_running(
+                    prompt_id, nodes.interrupt_processing
+                )
+                if interrupted:
+                    logging.info(f"Interrupting prompt {prompt_id}")
                 else:
                     logging.info(f"Prompt {prompt_id} is not currently running, skipping interrupt")
             else:
                 # No prompt_id provided, do a global interrupt
                 logging.info("Global interrupt (no prompt_id specified)")
-                nodes.interrupt_processing()
+                self.prompt_queue.interrupt_running(None, nodes.interrupt_processing)
 
             return web.Response(status=200)
 
@@ -921,6 +857,207 @@ class PromptServer():
         self.app.add_routes([
             web.static('/', self.web_root),
         ])
+
+    def register_socket_message_handler(self, message_type, handler):
+        if not isinstance(message_type, str) or not message_type or not callable(handler):
+            raise ValueError("socket message handler registration is invalid")
+        if message_type in self._socket_message_handlers:
+            raise RuntimeError(f"socket message handler already registered: {message_type}")
+        self._socket_message_handlers[message_type] = handler
+
+    def register_socket_lifecycle_callback(self, callback):
+        if not callable(callback):
+            raise ValueError("socket lifecycle callback must be callable")
+        if callback in self._socket_lifecycle_callbacks:
+            raise RuntimeError("socket lifecycle callback already registered")
+        self._socket_lifecycle_callbacks.append(callback)
+
+    def _publish_socket_lifecycle(self, event, sid, generation):
+        for callback in tuple(self._socket_lifecycle_callbacks):
+            try:
+                callback(event, sid, generation)
+            except Exception:
+                logging.exception("socket lifecycle callback failed")
+
+    async def get_current_socket_generation(self, sid):
+        async with self._socket_session_lock:
+            record = self._socket_sessions.get(sid)
+            if record is None or record["revoked"]:
+                return None
+            return record["generation"]
+
+    async def try_begin_generation_bound_side_effect(
+        self, sid, generation, socket_object, abort_token, transition_owner,
+    ):
+        async with self._socket_session_lock:
+            record = self._socket_sessions.get(sid)
+            generation_current = (
+                record is not None
+                and record["generation"] == generation
+                and record["socket"] is socket_object
+                and not record["revoked"]
+            )
+            return transition_owner.try_begin(
+                generation_current,
+                abort_observed=abort_token.aborted,
+            )
+
+    async def try_publish_generation_bound_terminal(
+        self, sid, generation, socket_object, abort_token, transition_owner,
+    ):
+        async with self._socket_session_lock:
+            record = self._socket_sessions.get(sid)
+            generation_current = (
+                record is not None
+                and record["generation"] == generation
+                and record["socket"] is socket_object
+                and not record["revoked"]
+            )
+            return transition_owner.publish_terminal(
+                generation_current,
+                abort_observed=abort_token.aborted,
+            )
+
+    async def send_json_exact(self, sid, generation, socket_object, event, data, timeout=5.0):
+        closed = False
+        async with self._socket_session_lock:
+            record = self._socket_sessions.get(sid)
+            if (
+                record is None
+                or record["generation"] != generation
+                or record["socket"] is not socket_object
+                or record["revoked"]
+            ):
+                return "replaced"
+            try:
+                await asyncio.wait_for(
+                    socket_object.send_json({"type": event, "data": data}),
+                    timeout=timeout,
+                )
+            except Exception:
+                record["revoked"] = True
+                self._socket_sessions.pop(sid, None)
+                if self.sockets.get(sid) is socket_object:
+                    self.sockets.pop(sid, None)
+                    self.sockets_metadata.pop(sid, None)
+                closed = True
+            else:
+                return "delivered"
+        if closed:
+            if not socket_object.closed:
+                await socket_object.close()
+            self._publish_socket_lifecycle("disconnected", sid, generation)
+        return "closed"
+
+    async def close_socket_generation(self, sid, generation, socket_object):
+        removed = False
+        async with self._socket_session_lock:
+            record = self._socket_sessions.get(sid)
+            if (
+                record is not None
+                and record["generation"] == generation
+                and record["socket"] is socket_object
+            ):
+                record["revoked"] = True
+                self._socket_sessions.pop(sid, None)
+                if self.sockets.get(sid) is socket_object:
+                    self.sockets.pop(sid, None)
+                    self.sockets_metadata.pop(sid, None)
+                removed = True
+        if not socket_object.closed:
+            await socket_object.close()
+        if removed:
+            self._publish_socket_lifecycle("disconnected", sid, generation)
+        return removed
+
+    async def _install_socket_generation(self, sid, socket_object):
+        replaced = None
+        async with self._socket_session_lock:
+            previous = self._socket_sessions.get(sid)
+            if previous is not None:
+                previous["revoked"] = True
+                replaced = (previous["generation"], previous["socket"])
+            self._socket_generation_counter += 1
+            generation = self._socket_generation_counter
+            self._socket_sessions[sid] = {
+                "generation": generation,
+                "socket": socket_object,
+                "revoked": False,
+                "feature_flags_set": False,
+            }
+            self.sockets[sid] = socket_object
+            self.sockets_metadata[sid] = {
+                "feature_flags": {},
+                "socket_generation": generation,
+            }
+        if replaced is not None:
+            replaced_generation, replaced_socket = replaced
+            if not replaced_socket.closed:
+                await replaced_socket.close()
+            self._publish_socket_lifecycle("disconnected", sid, replaced_generation)
+        self._publish_socket_lifecycle("connected", sid, generation)
+        return generation
+
+    async def _remove_socket_generation(self, sid, generation, socket_object):
+        removed = False
+        async with self._socket_session_lock:
+            record = self._socket_sessions.get(sid)
+            if (
+                record is not None
+                and record["generation"] == generation
+                and record["socket"] is socket_object
+            ):
+                record["revoked"] = True
+                self._socket_sessions.pop(sid, None)
+                if self.sockets.get(sid) is socket_object:
+                    self.sockets.pop(sid, None)
+                    self.sockets_metadata.pop(sid, None)
+                removed = True
+        if removed:
+            self._publish_socket_lifecycle("disconnected", sid, generation)
+
+    async def _handle_socket_text(self, sid, generation, socket_object, raw_message):
+        try:
+            message = json.loads(raw_message, object_pairs_hook=_reject_duplicate_socket_json_members)
+        except (json.JSONDecodeError, _DuplicateSocketJsonMember):
+            return False
+        if not isinstance(message, dict) or set(message) != {"type", "data"}:
+            return False
+        message_type = message.get("type")
+        data = message.get("data")
+        if not isinstance(message_type, str) or not isinstance(data, dict):
+            return False
+        feature_flags_settled_now = False
+        async with self._socket_session_lock:
+            record = self._socket_sessions.get(sid)
+            if (
+                record is None
+                or record["generation"] != generation
+                or record["socket"] is not socket_object
+                or record["revoked"]
+            ):
+                return False
+            if not record["feature_flags_set"]:
+                if message_type != "feature_flags":
+                    return False
+                record["feature_flags_set"] = True
+                self.sockets_metadata[sid]["feature_flags"] = dict(data)
+                feature_flags_settled_now = True
+                handler = None
+            else:
+                handler = self._socket_message_handlers.get(message_type)
+        if message_type == "feature_flags":
+            if not feature_flags_settled_now:
+                return False
+            disposition = await self.send_json_exact(
+                sid, generation, socket_object,
+                "feature_flags", feature_flags.get_server_features(),
+            )
+            return disposition == "delivered"
+        if handler is None:
+            return True
+        await handler(sid, generation, socket_object, data)
+        return True
 
     def get_queue_info(self):
         prompt_info = {}
@@ -1086,8 +1223,192 @@ class PromptServer():
     ) -> None:
         self.on_prompt_submit_handlers.append(handler)
 
+    def register_prompt_admission_provider(self, provider) -> None:
+        if self.prompt_admission_provider is not None:
+            raise RuntimeError("prompt admission provider already registered")
+        required = ("matches", "has_admission", "consume", "build_sidecar", "terminalize_prequeue")
+        if provider is None or any(not callable(getattr(provider, name, None)) for name in required):
+            raise ValueError("prompt admission provider is invalid")
+        self.prompt_admission_provider = provider
+
+    @staticmethod
+    def _prompt_submission_error(code, message, *, status=400):
+        error = {
+            "type": code,
+            "message": message,
+            "details": message,
+            "extra_info": {},
+        }
+        return web.json_response({"error": error, "node_errors": {}}, status=status)
+
+    async def _consume_prompt_admission(self, raw_json):
+        provider = self.prompt_admission_provider
+        has_admission = (
+            provider.has_admission(raw_json)
+            if provider is not None
+            else PROMPT_ADMISSION_FIELD in raw_json
+        )
+        raw_matches = provider is not None and provider.matches(raw_json)
+        if raw_matches and not has_admission:
+            raise RuntimeError("prompt_admission_required")
+        if has_admission and not raw_matches:
+            raise RuntimeError("prompt_admission_not_applicable")
+        if not raw_matches:
+            return None
+        return await provider.consume(raw_json)
+
+    def _prompt_number(self, json_data):
+        if "number" in json_data:
+            return float(json_data["number"])
+        number = self.number
+        if json_data.get("front"):
+            number = -number
+        self.number += 1
+        return number
+
+    @staticmethod
+    def _prompt_extra_data(json_data):
+        extra_data = json_data.get("extra_data", {})
+        if not isinstance(extra_data, dict):
+            logging.warning("extra_data payload is not a dict; resetting to empty")
+            extra_data = {}
+        else:
+            extra_data = copy.deepcopy(extra_data)
+        if "client_id" in json_data:
+            extra_data["client_id"] = json_data["client_id"]
+        return extra_data
+
+    async def _post_prompt(self, request):
+        logging.info("got prompt")
+        lease = None
+        queue_committed = False
+        provider = self.prompt_admission_provider
+        try:
+            raw_json = await request.json()
+            if not isinstance(raw_json, dict):
+                return self._prompt_submission_error("no_prompt", "No prompt provided")
+            try:
+                lease = await self._consume_prompt_admission(raw_json)
+            except RuntimeError as error:
+                if str(error) == "prompt_admission_required":
+                    return self._prompt_submission_error(
+                        "prompt_admission_required",
+                        "Workbench prompt admission is required",
+                    )
+                if str(error) == "prompt_admission_not_applicable":
+                    return self._prompt_submission_error(
+                        "prompt_admission_not_applicable",
+                        "Prompt admission cannot authorize an ordinary prompt",
+                    )
+                raise
+
+            json_data = self.trigger_on_prompt(
+                copy.deepcopy(raw_json), fail_closed=lease is not None
+            )
+            if not isinstance(json_data, dict) or "prompt" not in json_data:
+                return self._prompt_submission_error("no_prompt", "No prompt provided")
+
+            number = self._prompt_number(json_data)
+            prompt_id = str(json_data.get("prompt_id", uuid.uuid4()))
+            prompt = copy.deepcopy(json_data["prompt"])
+            partial_targets = copy.deepcopy(
+                json_data.get("partial_execution_targets")
+            )
+            valid = await execution.validate_prompt(
+                prompt_id, prompt, partial_targets
+            )
+            if not valid[0]:
+                logging.warning("invalid prompt: %s", valid[1])
+                return web.json_response(
+                    {"error": valid[1], "node_errors": valid[3]}, status=400
+                )
+
+            context = PromptSubmitContext(
+                request=request,
+                original_json=copy.deepcopy(json_data),
+                prompt=prompt,
+                prompt_id=prompt_id,
+                number=number,
+                outputs_to_execute=valid[2],
+                extra_data=self._prompt_extra_data(json_data),
+                client_id=json_data.get("client_id"),
+                partial_execution_targets=partial_targets,
+            )
+            hook_response = await self.trigger_on_prompt_submit(
+                context, fail_closed=lease is not None
+            )
+            if hook_response is not None:
+                if lease is not None:
+                    return self._prompt_submission_error(
+                        "prompt_admission_hook_short_circuit",
+                        "Admitted Workbench prompts cannot be short-circuited",
+                    )
+                return hook_response
+
+            final_json = copy.deepcopy(context.original_json)
+            if not isinstance(final_json, dict):
+                return self._prompt_submission_error(
+                    "prompt_transform_invalid", "Prompt transform returned invalid data"
+                )
+            final_prompt = copy.deepcopy(context.prompt)
+            final_json["prompt"] = final_prompt
+            final_matches = provider is not None and provider.matches(final_json)
+            if lease is not None and not final_matches:
+                return self._prompt_submission_error(
+                    "prompt_admission_downgrade_rejected",
+                    "An admitted Workbench prompt cannot become ordinary",
+                )
+            if lease is None and final_matches:
+                return self._prompt_submission_error(
+                    "prompt_admission_required",
+                    "Hooks cannot introduce Workbench into an unadmitted prompt",
+                )
+
+            final_valid = await execution.validate_prompt(
+                context.prompt_id,
+                final_prompt,
+                context.partial_execution_targets,
+            )
+            if not final_valid[0]:
+                logging.warning("invalid final prompt: %s", final_valid[1])
+                return web.json_response(
+                    {"error": final_valid[1], "node_errors": final_valid[3]},
+                    status=400,
+                )
+
+            item = (
+                context.number,
+                context.prompt_id,
+                final_prompt,
+                copy.deepcopy(context.extra_data),
+                final_valid[2],
+            )
+            if lease is None:
+                self.prompt_queue.put(item)
+            else:
+                sidecar = await provider.build_sidecar(lease, final_json)
+                self.prompt_queue.put_with_workbench_sidecar(item, sidecar)
+            queue_committed = True
+            return web.json_response(
+                {
+                    "prompt_id": context.prompt_id,
+                    "number": context.number,
+                    "node_errors": final_valid[3],
+                }
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            code = getattr(error, "code", "prompt_submission_failed")
+            status = getattr(error, "status", 400)
+            logging.error("prompt submission failed: %s", error, exc_info=True)
+            return self._prompt_submission_error(code, str(error), status=status)
+        finally:
+            if lease is not None and not queue_committed:
+                provider.terminalize_prequeue(lease, "prequeue_rejected")
+
     async def trigger_on_prompt_submit(
-        self, ctx: PromptSubmitContext
+        self, ctx: PromptSubmitContext, *, fail_closed: bool = False
     ) -> Optional[web.StreamResponse]:
         if not self.on_prompt_submit_handlers:
             return None
@@ -1100,8 +1421,10 @@ class PromptServer():
             except asyncio.CancelledError:
                 raise
             except Exception:
+                if fail_closed:
+                    raise
                 logging.error(
-                    "[ALCHEM] on_prompt_submit handler %s raised an exception; falling back to core queue",
+                    "on_prompt_submit handler %s raised an exception; continuing core queue",
                     getattr(handler, "__name__", repr(handler)),
                     exc_info=True,
                 )
@@ -1346,11 +1669,13 @@ class PromptServer():
     def add_on_prompt_handler(self, handler):
         self.on_prompt_handlers.append(handler)
 
-    def trigger_on_prompt(self, json_data):
+    def trigger_on_prompt(self, json_data, *, fail_closed=False):
         for handler in self.on_prompt_handlers:
             try:
                 json_data = handler(json_data)
             except Exception:
+                if fail_closed:
+                    raise
                 logging.warning("[ERROR] An error occurred during the on_prompt_handler processing")
                 logging.warning(traceback.format_exc())
 
