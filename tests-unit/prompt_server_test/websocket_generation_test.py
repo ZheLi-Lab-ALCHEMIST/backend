@@ -36,6 +36,15 @@ class FakeSocket:
         self.closed = True
 
 
+class TransitionOwner:
+    def __init__(self):
+        self.calls = []
+
+    def try_begin_post_guard_continuation(self, generation_current, abort_observed=False):
+        self.calls.append((generation_current, abort_observed))
+        return generation_current and not abort_observed
+
+
 def make_server():
     server = PromptServer.__new__(PromptServer)
     server._socket_session_lock = asyncio.Lock()
@@ -95,3 +104,23 @@ async def test_feature_flags_must_settle_before_typed_handler():
     ) is True
     assert received == [("client", generation, socket, {"value": 1})]
     assert socket.messages[0]["type"] == "feature_flags"
+
+
+async def test_post_guard_continuation_uses_exact_generation_lock_state():
+    server = make_server()
+    socket = FakeSocket()
+    generation = await server._install_socket_generation("client", socket)
+    owner = TransitionOwner()
+    abort_token = type("AbortToken", (), {"aborted": False})()
+
+    assert await server.try_begin_generation_bound_post_guard_continuation(
+        "client", generation, socket, abort_token, owner,
+    ) is True
+    assert owner.calls == [(True, False)]
+
+    replacement = FakeSocket()
+    await server._install_socket_generation("client", replacement)
+    assert await server.try_begin_generation_bound_post_guard_continuation(
+        "client", generation, socket, abort_token, owner,
+    ) is False
+    assert owner.calls[-1] == (False, False)

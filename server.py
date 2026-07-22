@@ -902,6 +902,22 @@ class PromptServer():
                 abort_observed=abort_token.aborted,
             )
 
+    async def try_begin_generation_bound_post_guard_continuation(
+        self, sid, generation, socket_object, abort_token, transition_owner,
+    ):
+        async with self._socket_session_lock:
+            record = self._socket_sessions.get(sid)
+            generation_current = (
+                record is not None
+                and record["generation"] == generation
+                and record["socket"] is socket_object
+                and not record["revoked"]
+            )
+            return transition_owner.try_begin_post_guard_continuation(
+                generation_current,
+                abort_observed=abort_token.aborted,
+            )
+
     async def try_publish_generation_bound_terminal(
         self, sid, generation, socket_object, abort_token, transition_owner,
     ):
