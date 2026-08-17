@@ -151,7 +151,9 @@ def _closed_result_fields(operation, durability=None):
     }
     if durability is None:
         return common | {"write_mode", "reason"}
-    fields = common | {"durability", "workflow_revision", "workflow_id"}
+    fields = common | {
+        "durability", "ledger_revision", "workflow_revision", "workflow_id",
+    }
     if operation == "write":
         fields |= {"workflow_storage_key", "workflow_fingerprint"}
     elif operation == "delete":
@@ -200,7 +202,10 @@ def _validate_mutation_result(result):
     if set(result) != _closed_result_fields(operation, durability):
         return None
     if (
-        not isinstance(result.get("workflow_revision"), int)
+        not isinstance(result.get("ledger_revision"), int)
+        or isinstance(result["ledger_revision"], bool)
+        or result["ledger_revision"] < 1
+        or not isinstance(result.get("workflow_revision"), int)
         or isinstance(result["workflow_revision"], bool)
         or result["workflow_revision"] < 1
     ):
@@ -442,8 +447,8 @@ def _parse_mutation_cas_headers(operation, write_mode, headers, raw_body):
     destination_absent = raw_destination_absent == "true"
     if operation == "write" and write_mode == "create":
         valid = (
-            workflow_id is None
-            and revision is None
+            _valid_hex64(workflow_id)
+            and revision is not None
             and before_fingerprint is None
             and destination_absent
             and _valid_hex64(after_fingerprint)
@@ -563,40 +568,62 @@ def _mutation_request_rejection_response(result):
 
 def _validate_workflow_identity_inventory(result, project_instance_id):
     if not isinstance(result, Mapping) or set(result) != {
-        "schema_id", "project_instance_id", "workflow_revision", "identities"
+        "schema_id", "project_instance_id", "ledger_revision", "identities"
     }:
         return None
-    revision = result.get("workflow_revision")
+    ledger_revision = result.get("ledger_revision")
     identities = result.get("identities")
     if (
-        result.get("schema_id") != "pm.workbench-workflow-identity-inventory.v1"
+        result.get("schema_id") != "pm.workbench-workflow-identity-inventory.v2"
         or result.get("project_instance_id") != project_instance_id
-        or type(revision) is not int
-        or revision < 1
+        or type(ledger_revision) is not int
+        or ledger_revision < 0
         or not isinstance(identities, list)
     ):
         return None
-    keys = []
+    filenames = []
+    storage_keys = []
     workflow_ids = set()
     for identity in identities:
-        if not isinstance(identity, Mapping) or set(identity) != {
-            "workflow_id", "workflow_storage_key", "workflow_revision",
-            "workflow_fingerprint",
-        }:
+        if not isinstance(identity, Mapping):
             return None
         storage_key = identity.get("workflow_storage_key")
+        expected_fields = {
+            "workflow_id", "workflow_filename", "workflow_storage_key",
+            "workflow_revision", "workflow_generation",
+            "host_workflow_instance_id",
+        }
+        if storage_key is not None:
+            expected_fields.add("workflow_fingerprint")
         if (
-            not _valid_hex64(identity.get("workflow_id"))
-            or not _valid_workflow_storage_key(storage_key)
-            or identity.get("workflow_revision") != revision
-            or not _valid_hex64(identity.get("workflow_fingerprint"))
+            set(identity) != expected_fields
+            or not _valid_hex64(identity.get("workflow_id"))
+            or not _valid_hex64(identity.get("workflow_filename"))
+            or type(identity.get("workflow_revision")) is not int
+            or identity["workflow_revision"] < 1
+            or type(identity.get("workflow_generation")) is not int
+            or identity["workflow_generation"] < 1
+            or not isinstance(identity.get("host_workflow_instance_id"), str)
+            or not identity["host_workflow_instance_id"]
+            or (
+                storage_key is not None
+                and (
+                    not _valid_workflow_storage_key(storage_key)
+                    or not _valid_hex64(identity.get("workflow_fingerprint"))
+                )
+            )
         ):
             return None
         if identity["workflow_id"] in workflow_ids:
             return None
         workflow_ids.add(identity["workflow_id"])
-        keys.append(storage_key)
-    if keys != sorted(set(keys)):
+        filenames.append(identity["workflow_filename"])
+        if storage_key is not None:
+            storage_keys.append(storage_key)
+    if (
+        filenames != sorted(set(filenames))
+        or len(storage_keys) != len(set(storage_keys))
+    ):
         return None
     return dict(result)
 

@@ -24,6 +24,8 @@ CORRELATION_HEADERS = {
 }
 CREATE_HEADERS = {
     **CORRELATION_HEADERS,
+    "X-Alchem-Workflow-Id": HEX_C,
+    "X-Alchem-Expected-Workflow-Revision": "1",
     "X-Alchem-Expected-Destination-Absent": "true",
     "X-Alchem-After-Content-Fingerprint": BODY_FINGERPRINT,
 }
@@ -147,6 +149,7 @@ def write_result(*, durability="confirmed"):
         "project_instance_id": "project-instance",
         "operation": "write",
         "durability": durability,
+        "ledger_revision": 4,
         "workflow_revision": 3,
         "workflow_id": HEX_C,
         "workflow_storage_key": "example.json",
@@ -165,7 +168,8 @@ def delete_result():
     return {
         "status": "committed", "mutation_request_id": HEX_A,
         "mutation_intent_digest": DELETE_INTENT_DIGEST, "project_instance_id": "project-instance",
-        "operation": "delete", "durability": "confirmed", "workflow_revision": 4,
+        "operation": "delete", "durability": "confirmed", "ledger_revision": 5,
+        "workflow_revision": 4,
         "workflow_id": HEX_C, "deleted_workflow_storage_key": "a.json",
         "deleted_content_fingerprint": HEX_B, "workflow_absent": True,
     }
@@ -175,7 +179,8 @@ def move_result():
     return {
         "status": "committed", "mutation_request_id": HEX_A,
         "mutation_intent_digest": MOVE_INTENT_DIGEST, "project_instance_id": "project-instance",
-        "operation": "move", "durability": "confirmed", "workflow_revision": 5,
+        "operation": "move", "durability": "confirmed", "ledger_revision": 6,
+        "workflow_revision": 5,
         "workflow_id": HEX_C, "source_workflow_storage_key": "a.json",
         "source_absent": True,
         "destination_workflow_storage_key": "b.json",
@@ -862,13 +867,16 @@ async def test_disposition_routes_project_closed_results(aiohttp_client, app, us
 
         async def list_userdata_workflow_identities(self, **kwargs):
             return {
-                "schema_id": "pm.workbench-workflow-identity-inventory.v1",
+                "schema_id": "pm.workbench-workflow-identity-inventory.v2",
                 "project_instance_id": "project-instance",
-                "workflow_revision": 3,
+                "ledger_revision": 4,
                 "identities": [{
                     "workflow_id": HEX_C,
+                    "workflow_filename": HEX_A,
                     "workflow_storage_key": "example.json",
                     "workflow_revision": 3,
+                    "workflow_generation": 1,
+                    "host_workflow_instance_id": "host-workflow-instance",
                     "workflow_fingerprint": HEX_B,
                 }],
             }
@@ -928,6 +936,12 @@ async def exact_pm_project_instance_routes(tmp_path, user_manager, monkeypatch):
     target_root = Path(manager.create_project("target-project", tmp_path)["project_path"])
     engine = WorkflowEngine(project_manager=manager)
     target_instance_id = manager.get_context_snapshot()["project_instance_id"]
+    lifecycle = engine.publish_active_workflow_lifecycle({
+        "project_instance_id": target_instance_id,
+        "host_workflow_instance_id": "root-user-manager-test-host",
+        "lifecycle_correlation_id": "root-user-manager-test-create",
+        "lifecycle_kind": "create",
+    })
     created = await engine.execute(
         operation="write",
         write_mode="create",
@@ -936,8 +950,8 @@ async def exact_pm_project_instance_routes(tmp_path, user_manager, monkeypatch):
         raw_body=WORKFLOW_BODY,
         mutation_request_id=HEX_A,
         project_instance_id=target_instance_id,
-        workflow_id=None,
-        expected_workflow_revision=None,
+        workflow_id=lifecycle["workflow_id"],
+        expected_workflow_revision=lifecycle["workflow_revision"],
         expected_before_fingerprint=None,
         expected_destination_absent=True,
         after_content_fingerprint=BODY_FINGERPRINT,
