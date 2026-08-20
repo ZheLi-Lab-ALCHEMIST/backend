@@ -941,6 +941,7 @@ async def exact_pm_project_instance_routes(tmp_path, user_manager, monkeypatch):
         "host_workflow_instance_id": "root-user-manager-test-host",
         "lifecycle_correlation_id": "root-user-manager-test-create",
         "lifecycle_kind": "create",
+        "content": WORKFLOW_BODY.decode("utf-8"),
     })
     created = await engine.execute(
         operation="write",
