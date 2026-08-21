@@ -5,7 +5,12 @@ import os
 from pathlib import Path
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from app.user_manager import UserManager, _canonical_json_text, _result_matches_request
+from app.user_manager import (
+    UserManager,
+    _canonical_json_text,
+    _result_matches_request,
+    _validate_workflow_identity_inventory,
+)
 from unittest.mock import AsyncMock, Mock, patch
 
 pytestmark = (
@@ -872,7 +877,7 @@ async def test_disposition_routes_project_closed_results(aiohttp_client, app, us
                 "ledger_revision": 4,
                 "identities": [{
                     "workflow_id": HEX_C,
-                    "workflow_filename": HEX_A,
+                    "workflow_filename": "phase10-workbench-real-1",
                     "workflow_storage_key": "example.json",
                     "workflow_revision": 3,
                     "workflow_generation": 1,
@@ -912,10 +917,98 @@ async def test_disposition_routes_project_closed_results(aiohttp_client, app, us
         "project_instance_id": "project-instance", "results": [write_result()]
     }
     assert identities.status == 200
-    assert (await identities.json())["identities"][0]["workflow_storage_key"] == (
-        "example.json"
-    )
+    identity = (await identities.json())["identities"][0]
+    assert identity["workflow_filename"] == "phase10-workbench-real-1"
+    assert identity["workflow_storage_key"] == "example.json"
     assert acknowledged.status == 204
+
+
+@pytest.mark.parametrize(
+    "workflow_filename",
+    [
+        "",
+        ".",
+        "..",
+        " padded",
+        "padded ",
+        "e\u0301",
+        "nested/name",
+        "nested\\name",
+        "bad\x1f",
+    ],
+)
+async def test_identity_inventory_rejects_malformed_workflow_filename(
+    workflow_filename,
+):
+    result = {
+        "schema_id": "pm.workbench-workflow-identity-inventory.v2",
+        "project_instance_id": "project-instance",
+        "ledger_revision": 1,
+        "identities": [{
+            "workflow_id": HEX_C,
+            "workflow_filename": workflow_filename,
+            "workflow_storage_key": "example.json",
+            "workflow_revision": 1,
+            "workflow_generation": 1,
+            "host_workflow_instance_id": "host-workflow-instance",
+            "workflow_fingerprint": HEX_B,
+        }],
+    }
+
+    assert _validate_workflow_identity_inventory(
+        result, "project-instance"
+    ) is None
+
+
+async def test_identity_inventory_matches_pm_filename_boundary_semantics():
+    base = {
+        "schema_id": "pm.workbench-workflow-identity-inventory.v2",
+        "project_instance_id": "project-instance",
+        "ledger_revision": 1,
+        "identities": [{
+            "workflow_id": HEX_C,
+            "workflow_filename": "\ufeffphase10",
+            "workflow_storage_key": "example.json",
+            "workflow_revision": 1,
+            "workflow_generation": 1,
+            "host_workflow_instance_id": "host-workflow-instance",
+            "workflow_fingerprint": HEX_B,
+        }],
+    }
+    assert _validate_workflow_identity_inventory(base, "project-instance") == base
+
+    base["identities"][0]["workflow_filename"] = "\u0085phase10"
+    assert _validate_workflow_identity_inventory(base, "project-instance") is None
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("workflow_id", "not-hex64"),
+        ("workflow_fingerprint", "not-hex64"),
+        ("workflow_generation", 0),
+    ],
+)
+async def test_identity_inventory_rejects_invalid_identity_tuple(field, value):
+    identity = {
+        "workflow_id": HEX_C,
+        "workflow_filename": "phase10-workbench-real-1",
+        "workflow_storage_key": "example.json",
+        "workflow_revision": 1,
+        "workflow_generation": 1,
+        "host_workflow_instance_id": "host-workflow-instance",
+        "workflow_fingerprint": HEX_B,
+    }
+    identity[field] = value
+    result = {
+        "schema_id": "pm.workbench-workflow-identity-inventory.v2",
+        "project_instance_id": "project-instance",
+        "ledger_revision": 1,
+        "identities": [identity],
+    }
+    assert _validate_workflow_identity_inventory(
+        result, "project-instance"
+    ) is None
 
 
 @pytest_asyncio.fixture

@@ -122,6 +122,19 @@ def _valid_hex64(value):
     return isinstance(value, str) and _HEX64.fullmatch(value) is not None
 
 
+def _valid_workflow_filename(value):
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and value == unicodedata.normalize("NFC", value)
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and not any(ord(char) < 32 for char in value)
+    )
+
+
 def _valid_storage_key(value):
     return (
         isinstance(value, str)
@@ -598,7 +611,7 @@ def _validate_workflow_identity_inventory(result, project_instance_id):
         if (
             set(identity) != expected_fields
             or not _valid_hex64(identity.get("workflow_id"))
-            or not _valid_hex64(identity.get("workflow_filename"))
+            or not _valid_workflow_filename(identity.get("workflow_filename"))
             or type(identity.get("workflow_revision")) is not int
             or identity["workflow_revision"] < 1
             or type(identity.get("workflow_generation")) is not int
