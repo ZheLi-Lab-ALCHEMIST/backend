@@ -619,11 +619,27 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
 
     return (ExecutionResult.SUCCESS, None, None)
 
+class WorkerExecutionContext:
+    """Host-owned context for an independent worker execution.
+
+    It deliberately has no PromptQueue. Interactive queue admission remains
+    owned by ``server.PromptQueue`` and is supplied only by the interactive
+    host path.
+    """
+
+    client_id = None
+    last_node_id = None
+
+    def send_sync(self, _event, _data, _client_id=None):
+        return None
+
+
 class PromptExecutor:
-    def __init__(self, server, cache_type=False, cache_size=None):
+    def __init__(self, server, cache_type=False, cache_size=None, workbench_sidecar=None):
         self.cache_size = cache_size
         self.cache_type = cache_type
         self.server = server
+        self.workbench_sidecar = workbench_sidecar
         self.reset()
 
     def reset(self):
@@ -668,13 +684,19 @@ class PromptExecutor:
             }
             self.add_message("execution_error", mes, broadcast=False)
 
-    def execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
-        asyncio.run(self.execute_async(prompt, prompt_id, extra_data, execute_outputs))
+    def execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[], workbench_sidecar=None, independent_worker=False):
+        asyncio.run(self.execute_async(prompt, prompt_id, extra_data, execute_outputs, workbench_sidecar=workbench_sidecar, independent_worker=independent_worker))
 
-    async def execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
-        _current_prompt_sidecar.set(
-            self.server.prompt_queue.get_workbench_sidecar(prompt_id)
-        )
+    async def execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[], workbench_sidecar=None, independent_worker=False):
+        if workbench_sidecar is not None:
+            sidecar = workbench_sidecar
+        elif self.workbench_sidecar is not None:
+            sidecar = self.workbench_sidecar
+        elif independent_worker:
+            sidecar = None
+        else:
+            sidecar = self.server.prompt_queue.get_workbench_sidecar(prompt_id)
+        _current_prompt_sidecar.set(sidecar)
         _current_prompt_node_id.set(None)
         nodes.interrupt_processing(False)
 
