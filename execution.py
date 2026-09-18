@@ -402,6 +402,13 @@ def get_output_from_returns(return_values, obj):
         ui = {k: [y for x in uis for y in x[k]] for k in uis[0].keys()}
     return output, ui, has_subgraph
 
+def _send_node_execution_event(server, event, data):
+    if isinstance(server, WorkerExecutionContext):
+        server.send_sync(event, {**data, "timestamp": int(time.time() * 1000)})
+    elif server.client_id is not None:
+        server.send_sync(event, data, server.client_id)
+
+
 def format_value(x):
     if x is None:
         return None
@@ -419,9 +426,9 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
     class_type = dynprompt.get_node(unique_id)['class_type']
     class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
     if caches.outputs.get(unique_id) is not None:
-        if server.client_id is not None:
+        if server.client_id is not None or isinstance(server, WorkerExecutionContext):
             cached_output = caches.ui.get(unique_id) or {}
-            server.send_sync("executed", { "node": unique_id, "display_node": display_node_id, "output": cached_output.get("output",None), "prompt_id": prompt_id }, server.client_id)
+            _send_node_execution_event(server, "executed", { "node": unique_id, "display_node": display_node_id, "output": cached_output.get("output",None), "prompt_id": prompt_id })
         get_progress_state().finish_progress(unique_id)
         execution_list.cache_update(unique_id, caches.outputs.get(unique_id))
         return (ExecutionResult.SUCCESS, None, None)
@@ -466,9 +473,9 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
         else:
             get_progress_state().start_progress(unique_id)
             input_data_all, missing_keys, hidden_inputs = get_input_data(inputs, class_def, unique_id, execution_list, dynprompt, extra_data)
-            if server.client_id is not None:
+            if server.client_id is not None or isinstance(server, WorkerExecutionContext):
                 server.last_node_id = display_node_id
-                server.send_sync("executing", { "node": unique_id, "display_node": display_node_id, "prompt_id": prompt_id }, server.client_id)
+                _send_node_execution_event(server, "executing", { "node": unique_id, "display_node": display_node_id, "prompt_id": prompt_id })
 
             obj = caches.objects.get(unique_id)
             if obj is None:
@@ -505,6 +512,8 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                         "current_inputs": [],
                         "current_outputs": [],
                     }
+                    if isinstance(server, WorkerExecutionContext):
+                        mes["timestamp"] = int(time.time() * 1000)
                     server.send_sync("execution_error", mes, server.client_id)
                     return ExecutionBlocker(None)
                 else:
@@ -532,8 +541,7 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                 },
                 "output": output_ui
             })
-            if server.client_id is not None:
-                server.send_sync("executed", { "node": unique_id, "display_node": display_node_id, "output": output_ui, "prompt_id": prompt_id }, server.client_id)
+            _send_node_execution_event(server, "executed", { "node": unique_id, "display_node": display_node_id, "output": output_ui, "prompt_id": prompt_id })
         if has_subgraph:
             cached_outputs = []
             new_node_ids = []
@@ -630,8 +638,11 @@ class WorkerExecutionContext:
     client_id = None
     last_node_id = None
 
-    def send_sync(self, _event, _data, _client_id=None):
-        return None
+    def __init__(self, event_consumer):
+        self.event_consumer = event_consumer
+
+    def send_sync(self, event, data, _client_id=None):
+        self.event_consumer(event, data)
 
 
 class PromptExecutor:
@@ -653,7 +664,7 @@ class PromptExecutor:
             "timestamp": int(time.time() * 1000),
         }
         self.status_messages.append((event, data))
-        if self.server.client_id is not None or broadcast:
+        if isinstance(self.server, WorkerExecutionContext) or self.server.client_id is not None or broadcast:
             self.server.send_sync(event, data, self.server.client_id)
 
     def handle_execution_error(self, prompt_id, prompt, current_outputs, executed, error, ex):
