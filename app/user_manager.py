@@ -412,7 +412,7 @@ def _has_duplicate_mutation_headers(headers):
     )
 
 
-def _parse_mutation_cas_headers(operation, write_mode, headers, raw_body):
+def _parse_mutation_headers(operation, write_mode, headers, raw_body):
     normalized = {}
     for name in _MUTATION_SINGLE_VALUE_HEADERS:
         values = _header_values(headers, name)
@@ -420,11 +420,13 @@ def _parse_mutation_cas_headers(operation, write_mode, headers, raw_body):
             return None
         if values:
             normalized[name] = values[0]
-    allowed_expected = {
-        "x-alchem-expected-workflow-revision",
-        "x-alchem-expected-before-fingerprint",
-        "x-alchem-expected-destination-absent",
-    }
+    replace = operation == "write" and write_mode == "replace"
+    allowed_expected = {"x-alchem-expected-destination-absent"}
+    if not replace:
+        allowed_expected.update({
+            "x-alchem-expected-workflow-revision",
+            "x-alchem-expected-before-fingerprint",
+        })
     if any(
         key.startswith("x-alchem-expected-") and key not in allowed_expected
         for key in {str(header).lower() for header in headers.keys()}
@@ -469,8 +471,6 @@ def _parse_mutation_cas_headers(operation, write_mode, headers, raw_body):
     elif operation == "write" and write_mode == "replace":
         valid = (
             _valid_hex64(workflow_id)
-            and revision is not None
-            and _valid_hex64(before_fingerprint)
             and not destination_absent
             and _valid_hex64(after_fingerprint)
         )
@@ -493,13 +493,17 @@ def _parse_mutation_cas_headers(operation, write_mode, headers, raw_body):
         )
     if not valid:
         return None
-    return {
+    facts = {
         "workflow_id": workflow_id,
-        "expected_workflow_revision": revision,
-        "expected_before_fingerprint": before_fingerprint,
         "expected_destination_absent": destination_absent,
         "after_content_fingerprint": after_fingerprint,
     }
+    if not replace:
+        facts.update({
+            "expected_workflow_revision": revision,
+            "expected_before_fingerprint": before_fingerprint,
+        })
+    return facts
 
 
 _DISPOSITION_REJECTION_STATUS = {
@@ -668,11 +672,14 @@ def _result_matches_request(result, request):
         ),
         "destination_storage_key": destination,
         "workflow_id": request.get("workflow_id"),
-        "expected_workflow_revision": request.get("expected_workflow_revision"),
-        "expected_before_fingerprint": request.get("expected_before_fingerprint"),
         "expected_destination_absent": request.get("expected_destination_absent"),
         "after_content_fingerprint": request.get("after_content_fingerprint"),
     }
+    if operation != "write" or write_mode != "replace":
+        intent.update({
+            "expected_workflow_revision": request.get("expected_workflow_revision"),
+            "expected_before_fingerprint": request.get("expected_before_fingerprint"),
+        })
     intent_digest = hashlib.sha256(
         _canonical_json_text(intent).encode("utf-8")
     ).hexdigest()
@@ -685,7 +692,8 @@ def _result_matches_request(result, request):
         return False
     expected_revision = request.get("expected_workflow_revision")
     if (
-        expected_revision is not None
+        (operation != "write" or write_mode != "replace")
+        and expected_revision is not None
         and result.get("workflow_revision") != expected_revision + 1
     ):
         return False
@@ -840,15 +848,15 @@ class UserManager():
         )
         if invalid is not None:
             return invalid
-        cas_facts = _parse_mutation_cas_headers(
+        mutation_facts = _parse_mutation_headers(
             kwargs["operation"],
             kwargs["write_mode"],
             kwargs["request_headers"],
             kwargs["raw_body"],
         )
-        if cas_facts is None:
+        if mutation_facts is None:
             return _invalid_request()
-        kwargs.update(cas_facts)
+        kwargs.update(mutation_facts)
         try:
             result = await provider.execute(**kwargs)
         except Exception:

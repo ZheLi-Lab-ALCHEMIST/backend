@@ -37,8 +37,6 @@ CREATE_HEADERS = {
 REPLACE_HEADERS = {
     **CORRELATION_HEADERS,
     "X-Alchem-Workflow-Id": HEX_C,
-    "X-Alchem-Expected-Workflow-Revision": "2",
-    "X-Alchem-Expected-Before-Fingerprint": HEX_B,
     "X-Alchem-Expected-Destination-Absent": "false",
     "X-Alchem-After-Content-Fingerprint": BODY_FINGERPRINT,
 }
@@ -75,6 +73,9 @@ def _intent_digest(
         "expected_destination_absent": destination_absent,
         "after_content_fingerprint": after_fingerprint,
     }
+    if operation == "write" and write_mode == "replace":
+        del intent["expected_workflow_revision"]
+        del intent["expected_before_fingerprint"]
     return hashlib.sha256(_canonical_json_text(intent).encode()).hexdigest()
 
 
@@ -105,7 +106,7 @@ async def test_workflow_mutation_canonical_json_matches_browser_numbers():
     )
 
 
-async def test_workflow_mutation_result_must_match_full_cas_request():
+async def test_workflow_mutation_result_must_match_replace_request():
     request = {
         "operation": "write",
         "write_mode": "replace",
@@ -114,21 +115,19 @@ async def test_workflow_mutation_result_must_match_full_cas_request():
         "mutation_request_id": HEX_A,
         "project_instance_id": "project-instance",
         "workflow_id": HEX_C,
-        "expected_workflow_revision": 2,
-        "expected_before_fingerprint": HEX_B,
         "expected_destination_absent": False,
         "after_content_fingerprint": BODY_FINGERPRINT,
     }
     assert _result_matches_request(write_result(), request)
     for field, value in (
         ("workflow_id", HEX_A),
-        ("workflow_revision", 4),
         ("workflow_storage_key", "other.json"),
         ("workflow_fingerprint", HEX_A),
         ("mutation_intent_digest", HEX_A),
     ):
         result = {**write_result(), field: value}
         assert not _result_matches_request(result, request)
+    assert _result_matches_request({**write_result(), "workflow_revision": 9}, request)
 
 
 @pytest_asyncio.fixture
@@ -466,7 +465,11 @@ async def test_duplicate_mutation_headers_reject_before_provider_execute(
     provider = MutationProvider(result=write_result())
     user_manager.add_userdata_mutation_transaction_provider(provider)
     client = await aiohttp_client(app)
-    headers = [*REPLACE_HEADERS.items(), (header_name, "duplicate")]
+    headers = [
+        *REPLACE_HEADERS.items(),
+        (header_name, "duplicate"),
+        (header_name, "also-duplicate"),
+    ]
 
     response = await client.post(
         "/userdata/workflows%252Fexample.json?write_mode=replace",
@@ -500,7 +503,8 @@ async def test_duplicate_mutation_headers_do_not_change_ordinary_userdata(
 async def test_userdata_mutation_transaction_provider_encloses_commit(
     aiohttp_client, app, user_manager, tmp_path
 ):
-    provider = MutationProvider(result=write_result())
+    actual_result = {**write_result(), "workflow_revision": 9, "ledger_revision": 10}
+    provider = MutationProvider(result=actual_result)
     user_manager.add_userdata_mutation_transaction_provider(provider)
     client = await aiohttp_client(app)
 
@@ -511,14 +515,16 @@ async def test_userdata_mutation_transaction_provider_encloses_commit(
     )
 
     assert resp.status == 200
-    assert await resp.json() == write_result()
+    assert await resp.json() == actual_result
     assert resp.headers["X-Alchem-Mutation-Disposition"] == "committed_confirmed"
-    assert resp.headers["X-Alchem-Workflow-Revision"] == "3"
+    assert resp.headers["X-Alchem-Workflow-Revision"] == "9"
     assert resp.headers["X-Alchem-Workflow-Storage-Key"] == "example.json"
     assert not (tmp_path / "workflows" / "example.json").exists()
     assert provider.execute.await_args.kwargs["source_storage_key"] == "workflows/example.json"
     assert provider.execute.await_args.kwargs["destination_storage_key"] == "workflows/example.json"
     assert provider.execute.await_args.kwargs["raw_body"] == b'{"nodes":[]}'
+    assert "expected_workflow_revision" not in provider.execute.await_args.kwargs
+    assert "expected_before_fingerprint" not in provider.execute.await_args.kwargs
 
 
 async def test_userdata_mutation_transaction_provider_is_unique(user_manager):
