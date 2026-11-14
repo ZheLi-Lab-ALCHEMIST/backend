@@ -12,7 +12,7 @@
 4. **custom_nodes/ALCHEM_PropBtn** - 分子处理和3D可视化节点
 5. **custom_nodes/NODE_ALCHEM_Dock** - 分子对接节点
 6. **custom_nodes/ALCHEM_PropBtn/nodes/process/NODE_bfee_dock** - BFEE Docking 节点
-7. **custom_nodes/project_manager** - 项目管理插件
+7. **custom_nodes/ALCHEM_project_manager** - 项目管理插件
 
 ## 系统要求
 
@@ -110,13 +110,13 @@ pip install gemmi  # meeko 的额外依赖
 
 主要依赖：pytorch-lightning, lightning, torch-geometric, fair-esm, biopython, meeko, wandb, gemmi
 
-#### 6.3 project_manager
+#### 6.3 ALCHEM_project_manager
 
 ```bash
-pip install -r custom_nodes/project_manager/requirements.txt
+pip install -r custom_nodes/ALCHEM_project_manager/requirements.txt
 ```
 
-主要依赖：aiofiles, pytest, pytest-asyncio, pydantic, watchdog
+依赖：pytest, aiohttp
 
 #### 6.4 NODE_bfee_dock (Conda 依赖)
 
@@ -191,18 +191,18 @@ ls -lh custom_nodes/ALCHEM_PropBtn/web/ketcher/lib/
 # 应该看到: index.html, static/ 目录, 以及其他 Ketcher 文件
 ```
 
-#### 6.6 构建 project_manager Vue 前端
+#### 6.6 构建 ALCHEM_project_manager Vue 前端
 
-project_manager 插件包含一个 Vue.js 前端，需要单独构建：
+ALCHEM_project_manager 插件包含一个 Vue.js 前端，需要单独构建：
 
 ```bash
-cd custom_nodes/project_manager/web
+cd custom_nodes/ALCHEM_project_manager/web
 npm install
 npm run build
 cd ../../..
 ```
 
-构建完成后会在 `custom_nodes/project_manager/web/dist/` 目录生成 `main.js` 文件。
+构建完成后会在 `custom_nodes/ALCHEM_project_manager/web/dist/` 目录生成 `main.js` 文件。
 
 ### 7. 构建主前端
 
