@@ -341,6 +341,52 @@ def _requires_workflow_mutation_owner(*storage_keys):
     return any(_is_canonical_saved_workflow_key(key) for key in storage_keys)
 
 
+def _valid_project_path(value):
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and "\x00" not in value
+        and os.path.isabs(value)
+    )
+
+
+def _single_query_value(query, name):
+    getall = getattr(query, "getall", None)
+    values = list(getall(name, [])) if callable(getall) else (
+        [query[name]] if name in query else []
+    )
+    return values[0] if len(values) == 1 else None
+
+
+def _captured_project_scope(query, *, require_revision=False, require_instance=False):
+    # Transport carries the captured folder; its physical owner validates the root.
+    for name in ("project_path", "project_instance_id", "context_revision"):
+        getall = getattr(query, "getall", None)
+        if callable(getall) and len(getall(name, [])) > 1:
+            return None
+    path = _single_query_value(query, "project_path")
+    if not _valid_project_path(path):
+        return None
+    scope = {"project_path": path}
+    if require_instance:
+        instance = _single_query_value(query, "project_instance_id")
+        if not isinstance(instance, str) or not instance:
+            return None
+        scope["project_instance_id"] = instance
+    if require_revision:
+        revision = _single_query_value(query, "context_revision")
+        if (
+            not isinstance(revision, str)
+            or not re.fullmatch(r"0|[1-9][0-9]*", revision)
+        ):
+            return None
+        try:
+            scope["context_revision"] = int(revision)
+        except ValueError:
+            return None
+    return scope
+
+
 def _validate_transaction_request(
     *, operation, write_mode, source_key, destination_key, raw_body,
     mutation_request_id, project_instance_id, require_correlation=False
@@ -772,6 +818,7 @@ class UserManager():
             "list_userdata_mutation_dispositions",
             "list_userdata_workflow_identities",
             "acknowledge_userdata_mutation_disposition",
+            "read_userdata_workflow",
         }
         if any(not callable(getattr(provider, name, None)) for name in required_methods):
             raise TypeError("userdata mutation transaction provider contract is incomplete")
@@ -793,31 +840,35 @@ class UserManager():
         return remove_provider
 
     async def get_userdata_mutation_disposition(
-        self, project_instance_id, mutation_request_id
+        self, project_instance_id, mutation_request_id, *, project_path
     ):
         return await self._call_disposition_provider(
             "get_userdata_mutation_disposition",
+            project_path=project_path,
             project_instance_id=project_instance_id,
             mutation_request_id=mutation_request_id,
         )
 
-    async def list_userdata_mutation_dispositions(self, project_instance_id):
+    async def list_userdata_mutation_dispositions(self, project_instance_id, *, project_path):
         return await self._call_disposition_provider(
             "list_userdata_mutation_dispositions",
+            project_path=project_path,
             project_instance_id=project_instance_id,
         )
 
-    async def list_userdata_workflow_identities(self, project_instance_id):
+    async def list_userdata_workflow_identities(self, project_instance_id, *, project_path):
         return await self._call_disposition_provider(
             "list_userdata_workflow_identities",
+            project_path=project_path,
             project_instance_id=project_instance_id,
         )
 
     async def acknowledge_userdata_mutation_disposition(
-        self, project_instance_id, mutation_request_id, result_digest
+        self, project_instance_id, mutation_request_id, result_digest, *, project_path
     ):
         return await self._call_disposition_provider(
             "acknowledge_userdata_mutation_disposition",
+            project_path=project_path,
             project_instance_id=project_instance_id,
             mutation_request_id=mutation_request_id,
             result_digest=result_digest,
@@ -845,6 +896,12 @@ class UserManager():
             return _provider_failure_response() if require_correlation else None
         if matched is not True:
             return _invalid_provider_result_response()
+        scope = _captured_project_scope(
+            kwargs["request_query"], require_revision=True
+        )
+        if scope is None:
+            return _invalid_request(field="project_context")
+        kwargs.update(scope)
         invalid = _validate_transaction_request(
             operation=kwargs["operation"],
             write_mode=kwargs["write_mode"],
@@ -1205,12 +1262,15 @@ class UserManager():
         @routes.get("/userdata/mutation-disposition/{mutation_request_id}")
         async def get_mutation_disposition(request):
             mutation_request_id = request.match_info["mutation_request_id"]
-            project_instance_id = request.query.get("project_instance_id")
+            scope = _captured_project_scope(request.query, require_instance=True)
+            if scope is None:
+                return _invalid_request(field="project_context")
+            project_instance_id = scope["project_instance_id"]
             if not _valid_hex64(mutation_request_id) or not project_instance_id:
                 return _invalid_request()
             try:
                 result = await self.get_userdata_mutation_disposition(
-                    project_instance_id, mutation_request_id
+                    project_instance_id, mutation_request_id, project_path=scope["project_path"]
                 )
             except Exception:
                 logging.exception("Userdata mutation disposition lookup failed")
@@ -1231,12 +1291,15 @@ class UserManager():
 
         @routes.get("/userdata/mutation-dispositions")
         async def list_mutation_dispositions(request):
-            project_instance_id = request.query.get("project_instance_id")
+            scope = _captured_project_scope(request.query, require_instance=True)
+            if scope is None:
+                return _invalid_request(field="project_context")
+            project_instance_id = scope["project_instance_id"]
             if not project_instance_id:
                 return _invalid_request()
             try:
                 result = await self.list_userdata_mutation_dispositions(
-                    project_instance_id
+                    project_instance_id, project_path=scope["project_path"]
                 )
             except Exception:
                 logging.exception("Userdata mutation disposition listing failed")
@@ -1267,12 +1330,15 @@ class UserManager():
 
         @routes.get("/userdata/workflow-identities")
         async def list_workflow_identities(request):
-            project_instance_id = request.query.get("project_instance_id")
+            scope = _captured_project_scope(request.query, require_instance=True)
+            if scope is None:
+                return _invalid_request(field="project_context")
+            project_instance_id = scope["project_instance_id"]
             if not project_instance_id:
                 return _invalid_request()
             try:
                 result = await self.list_userdata_workflow_identities(
-                    project_instance_id
+                    project_instance_id, project_path=scope["project_path"]
                 )
             except Exception:
                 logging.exception("Userdata workflow identity listing failed")
@@ -1299,14 +1365,17 @@ class UserManager():
             except (json.JSONDecodeError, TypeError):
                 return _invalid_request()
             if not isinstance(body, Mapping) or set(body) != {
-                "project_instance_id", "mutation_request_id", "result_digest"
+                "project_path", "project_instance_id", "mutation_request_id", "result_digest"
             }:
                 return _invalid_request()
+            project_path = body.get("project_path")
             project_instance_id = body.get("project_instance_id")
             body_id = body.get("mutation_request_id")
             result_digest = body.get("result_digest")
             if (
-                not project_instance_id
+                not _valid_project_path(project_path)
+                or not isinstance(project_instance_id, str)
+                or not project_instance_id
                 or not _valid_hex64(path_id)
                 or not _valid_hex64(body_id)
                 or not _valid_hex64(result_digest)
@@ -1321,7 +1390,7 @@ class UserManager():
                 }, status=412)
             try:
                 result = await self.acknowledge_userdata_mutation_disposition(
-                    project_instance_id, body_id, result_digest
+                    project_instance_id, body_id, result_digest, project_path=project_path
                 )
             except Exception:
                 logging.exception("Userdata mutation disposition acknowledgement failed")
@@ -1337,6 +1406,31 @@ class UserManager():
 
         @routes.get("/userdata/{file}")
         async def getuserdata(request):
+            if any(name in request.query for name in ("project_path", "project_instance_id")):
+                scope = _captured_project_scope(request.query, require_instance=True)
+                logical_key = get_logical_storage_key(request)
+                if (
+                    scope is None
+                    or not _valid_workflow_storage_key(logical_key)
+                    or not _requires_workflow_mutation_owner(logical_key)
+                ):
+                    return _invalid_request(field="project_context")
+                try:
+                    content = await self._call_disposition_provider(
+                        "read_userdata_workflow",
+                        **scope,
+                        storage_key=logical_key[len("workflows/"):],
+                    )
+                except FileNotFoundError:
+                    return web.Response(status=404)
+                except PermissionError:
+                    return web.Response(status=403)
+                except Exception:
+                    logging.exception("Userdata original-folder workflow reread failed")
+                    return _provider_failure_response()
+                if not isinstance(content, bytes):
+                    return _invalid_provider_result_response()
+                return web.Response(body=content, content_type="application/json")
             path = get_user_data_path(request, check_exists=True)
             if not isinstance(path, str):
                 return path
@@ -1421,7 +1515,7 @@ class UserManager():
                 require_correlation=require_correlation,
                 user_id=self.get_request_user_id(request),
                 request_headers=request.headers,
-                request_query=dict(request.query),
+                request_query=request.query,
                 response_request=request,
             )
             if transaction_response is not None:
@@ -1499,7 +1593,7 @@ class UserManager():
                 require_correlation=require_correlation,
                 user_id=self.get_request_user_id(request),
                 request_headers=request.headers,
-                request_query=dict(request.query),
+                request_query=request.query,
                 response_request=request,
             )
             if transaction_response is not None:
@@ -1598,7 +1692,7 @@ class UserManager():
                 require_correlation=require_correlation,
                 user_id=self.get_request_user_id(request),
                 request_headers=request.headers,
-                request_query=dict(request.query),
+                request_query=request.query,
                 response_request=request,
             )
             if transaction_response is not None:

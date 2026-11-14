@@ -1,11 +1,12 @@
 import pytest
 import pytest_asyncio
 import hashlib
+import json as json_module
 import os
 from copy import deepcopy
 from pathlib import Path
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import make_mocked_request
 from app.user_manager import (
     UserManager,
     _canonical_json_text,
@@ -131,19 +132,58 @@ async def test_workflow_mutation_result_must_match_replace_request():
     assert _result_matches_request({**write_result(), "workflow_revision": 9}, request)
 
 
-@pytest_asyncio.fixture
-async def aiohttp_client():
-    clients = []
+@pytest.fixture
+def aiohttp_client():
+    """Dispatch through the real router/handlers without opening a test socket."""
+    class DirectResponse:
+        def __init__(self, response):
+            self.response = response
+            self.status = response.status
+            self.headers = response.headers
+
+        async def read(self):
+            if isinstance(self.response, web.FileResponse):
+                return Path(self.response._path).read_bytes()
+            return self.response.body or b""
+
+        async def text(self):
+            return (await self.read()).decode("utf-8")
+
+        async def json(self):
+            return json_module.loads(await self.text())
+
+    class DirectClient:
+        def __init__(self, application):
+            self.application = application
+            application.freeze()
+
+        async def request(self, method, path, *, headers=None, data=b"", json=None):
+            raw = data.encode("utf-8") if isinstance(data, str) else data
+            if json is not None:
+                raw = json_module.dumps(json).encode("utf-8")
+            request = make_mocked_request(method, path, headers=headers)
+            request._match_info = await self.application.router.resolve(request)
+            request.read = AsyncMock(return_value=raw)
+            request.json = AsyncMock(side_effect=lambda: json_module.loads(raw))
+            try:
+                response = await request.match_info.handler(request)
+            except web.HTTPException as exc:
+                response = exc
+            return DirectResponse(response)
+
+        async def get(self, path, **kwargs):
+            return await self.request("GET", path, **kwargs)
+
+        async def post(self, path, **kwargs):
+            return await self.request("POST", path, **kwargs)
+
+        async def delete(self, path, **kwargs):
+            return await self.request("DELETE", path, **kwargs)
 
     async def create_client(application):
-        client = TestClient(TestServer(application))
-        await client.start_server()
-        clients.append(client)
-        return client
+        return DirectClient(application)
 
-    yield create_client
-    for client in clients:
-        await client.close()
+    return create_client
 
 
 def write_result(*, durability="confirmed"):
@@ -209,6 +249,7 @@ class MutationProvider:
         self.list_userdata_mutation_dispositions = AsyncMock()
         self.list_userdata_workflow_identities = AsyncMock()
         self.acknowledge_userdata_mutation_disposition = AsyncMock()
+        self.read_userdata_workflow = AsyncMock()
 
 
 @pytest.fixture
@@ -416,7 +457,7 @@ async def test_nonmatching_provider_cannot_release_saved_workflow_to_native(
     client = await aiohttp_client(app)
 
     response = await client.post(
-        "/userdata/workflows%252Fexample.json?write_mode=replace",
+        "/userdata/workflows%252Fexample.json?write_mode=replace&project_path=%2Fprojects%2Fa&context_revision=4",
         data=WORKFLOW_BODY,
         headers=REPLACE_HEADERS,
     )
@@ -441,7 +482,7 @@ async def test_duplicate_json_keys_reject_before_provider_execute(
     client = await aiohttp_client(app)
 
     response = await client.post(
-        "/userdata/workflows%252Fexample.json?write_mode=replace",
+        "/userdata/workflows%252Fexample.json?write_mode=replace&project_path=%2Fprojects%2Fa&context_revision=4",
         data=body,
         headers=headers,
     )
@@ -473,7 +514,7 @@ async def test_duplicate_mutation_headers_reject_before_provider_execute(
     ]
 
     response = await client.post(
-        "/userdata/workflows%252Fexample.json?write_mode=replace",
+        "/userdata/workflows%252Fexample.json?write_mode=replace&project_path=%2Fprojects%2Fa&context_revision=4",
         data=WORKFLOW_BODY,
         headers=headers,
     )
@@ -510,7 +551,7 @@ async def test_userdata_mutation_transaction_provider_encloses_commit(
     client = await aiohttp_client(app)
 
     resp = await client.post(
-        "/userdata/workflows%252Fexample.json?write_mode=replace",
+        "/userdata/workflows%252Fexample.json?write_mode=replace&project_path=%2Fprojects%2Fa&context_revision=4",
         data=WORKFLOW_BODY,
         headers=REPLACE_HEADERS,
     )
@@ -554,7 +595,7 @@ async def test_matched_workflow_without_correlation_never_falls_back(
     user_manager.add_userdata_mutation_transaction_provider(provider)
     client = await aiohttp_client(app)
 
-    resp = await client.post("/userdata/workflows%252Fexample.json", data=b"payload")
+    resp = await client.post("/userdata/workflows%252Fexample.json?project_path=%2Fprojects%2Fa&context_revision=4", data=b"payload")
 
     assert resp.status == 400
     provider.execute.assert_not_awaited()
@@ -567,7 +608,7 @@ async def test_correlated_request_without_owner_never_falls_back(
     client = await aiohttp_client(app)
 
     resp = await client.post(
-        "/userdata/workflows%252Fexample.json?write_mode=create",
+        "/userdata/workflows%252Fexample.json?write_mode=create&project_path=%2Fprojects%2Fa&context_revision=4",
         data=WORKFLOW_BODY,
         headers=CREATE_HEADERS,
     )
@@ -582,7 +623,7 @@ async def test_saved_workflow_without_owner_or_correlation_never_falls_back(
     client = await aiohttp_client(app)
 
     response = await client.post(
-        "/userdata/workflows%252Fno-owner.json",
+        "/userdata/workflows%252Fno-owner.json?project_path=%2Fprojects%2Fa&context_revision=4",
         data=WORKFLOW_BODY,
     )
 
@@ -600,7 +641,7 @@ async def test_matched_provider_malformed_result_never_falls_back(
     client = await aiohttp_client(app)
 
     resp = await client.post(
-        "/userdata/workflows%252Fexample.json?write_mode=replace",
+        "/userdata/workflows%252Fexample.json?write_mode=replace&project_path=%2Fprojects%2Fa&context_revision=4",
         data=WORKFLOW_BODY,
         headers=REPLACE_HEADERS,
     )
@@ -618,7 +659,7 @@ async def test_provider_exception_never_falls_back(
     client = await aiohttp_client(app)
 
     resp = await client.post(
-        "/userdata/workflows%252Fexample.json?write_mode=replace",
+        "/userdata/workflows%252Fexample.json?write_mode=replace&project_path=%2Fprojects%2Fa&context_revision=4",
         data=WORKFLOW_BODY,
         headers=REPLACE_HEADERS,
     )
@@ -640,7 +681,7 @@ async def test_uncertain_provider_result_projects_exact_202_headers(
     client = await aiohttp_client(app)
 
     resp = await client.post(
-        "/userdata/workflows%252Fexample.json?write_mode=replace",
+        "/userdata/workflows%252Fexample.json?write_mode=replace&project_path=%2Fprojects%2Fa&context_revision=4",
         data=WORKFLOW_BODY,
         headers=REPLACE_HEADERS,
     )
@@ -662,10 +703,10 @@ async def test_delete_and_move_use_transaction_provider(aiohttp_client, app, use
     client = await aiohttp_client(app)
 
     deleted = await client.delete(
-        "/userdata/workflows%252Fa.json", headers=DELETE_HEADERS
+        "/userdata/workflows%252Fa.json?project_path=%2Fprojects%2Fa&context_revision=4", headers=DELETE_HEADERS
     )
     moved = await client.post(
-        "/userdata/workflows%252Fa.json/move/workflows%252Fb.json",
+        "/userdata/workflows%252Fa.json/move/workflows%252Fb.json?project_path=%2Fprojects%2Fa&context_revision=4",
         headers=MOVE_HEADERS,
     )
 
@@ -689,7 +730,7 @@ async def test_nonmatching_provider_cannot_release_saved_move_to_native(
     client = await aiohttp_client(app)
 
     response = await client.post(
-        "/userdata/workflows%252Fa.json/move/workflows%252Fb.json",
+        "/userdata/workflows%252Fa.json/move/workflows%252Fb.json?project_path=%2Fprojects%2Fa&context_revision=4",
         headers=MOVE_HEADERS,
     )
 
@@ -703,7 +744,7 @@ async def test_nonmatching_provider_cannot_release_saved_move_to_native(
     (
         "workflows/a.json",
         "plain.json",
-        "/userdata/workflows%252Fa.json/move/plain.json",
+        "/userdata/workflows%252Fa.json/move/plain.json?project_path=%2Fprojects%2Fa&context_revision=4",
     ),
     (
         "plain.json",
@@ -745,7 +786,7 @@ async def test_precommit_result_has_exact_status_and_no_commit_headers(
     client = await aiohttp_client(app)
 
     resp = await client.post(
-        "/userdata/workflows%252Fa.json/move/workflows%252Fb.json",
+        "/userdata/workflows%252Fa.json/move/workflows%252Fb.json?project_path=%2Fprojects%2Fa&context_revision=4",
         headers=MOVE_HEADERS,
     )
 
@@ -765,7 +806,7 @@ async def test_provider_owned_project_context_precommit_passes_exactly(
     client = await aiohttp_client(app)
 
     response = await client.post(
-        "/userdata/workflows%252Fa.json/move/workflows%252Fb.json",
+        "/userdata/workflows%252Fa.json/move/workflows%252Fb.json?project_path=%2Fprojects%2Fa&context_revision=4",
         headers=MOVE_HEADERS,
     )
 
@@ -787,7 +828,7 @@ async def test_replay_rejection_is_closed_409(aiohttp_client, app, user_manager)
     client = await aiohttp_client(app)
 
     resp = await client.post(
-        "/userdata/workflows%252Fexample.json?write_mode=replace",
+        "/userdata/workflows%252Fexample.json?write_mode=replace&project_path=%2Fprojects%2Fa&context_revision=4",
         data=WORKFLOW_BODY,
         headers=REPLACE_HEADERS,
     )
@@ -805,7 +846,7 @@ async def test_invalid_write_mode_rejects_before_provider(
     client = await aiohttp_client(app)
 
     resp = await client.post(
-        "/userdata/workflows%252Fexample.json?write_mode=overwrite",
+        "/userdata/workflows%252Fexample.json?write_mode=overwrite&project_path=%2Fprojects%2Fa&context_revision=4",
         data=WORKFLOW_BODY,
     )
 
@@ -827,7 +868,7 @@ async def test_schema_valid_result_for_different_request_fails_closed(
     client = await aiohttp_client(app)
 
     resp = await client.post(
-        "/userdata/workflows%252Fexample.json?write_mode=replace",
+        "/userdata/workflows%252Fexample.json?write_mode=replace&project_path=%2Fprojects%2Fa&context_revision=4",
         data=WORKFLOW_BODY,
         headers=REPLACE_HEADERS,
     )
@@ -840,6 +881,7 @@ async def test_disposition_methods_delegate_to_registered_provider(user_manager)
     class Provider:
         matches = Mock(return_value=False)
         execute = AsyncMock()
+        read_userdata_workflow = AsyncMock()
 
         get_userdata_mutation_disposition = AsyncMock(return_value=write_result())
         list_userdata_mutation_dispositions = AsyncMock(return_value={
@@ -852,24 +894,35 @@ async def test_disposition_methods_delegate_to_registered_provider(user_manager)
     user_manager.add_userdata_mutation_transaction_provider(provider)
 
     assert await user_manager.get_userdata_mutation_disposition(
-        "project-instance", HEX_A
+        "project-instance", HEX_A, project_path="/projects/a"
     ) == write_result()
     assert await user_manager.list_userdata_mutation_dispositions(
-        "project-instance"
+        "project-instance", project_path="/projects/a"
     ) == {"project_instance_id": "project-instance", "results": [write_result()]}
-    await user_manager.list_userdata_workflow_identities("project-instance")
+    await user_manager.list_userdata_workflow_identities("project-instance", project_path="/projects/a")
     provider.list_userdata_workflow_identities.assert_awaited_once_with(
-        project_instance_id="project-instance"
+        project_path="/projects/a", project_instance_id="project-instance"
     )
     assert await user_manager.acknowledge_userdata_mutation_disposition(
-        "project-instance", HEX_A, HEX_B
+        "project-instance", HEX_A, HEX_B, project_path="/projects/a"
     ) is None
+    provider.get_userdata_mutation_disposition.assert_awaited_once_with(
+        project_path="/projects/a", project_instance_id="project-instance", mutation_request_id=HEX_A
+    )
+    provider.list_userdata_mutation_dispositions.assert_awaited_once_with(
+        project_path="/projects/a", project_instance_id="project-instance"
+    )
+    provider.acknowledge_userdata_mutation_disposition.assert_awaited_once_with(
+        project_path="/projects/a", project_instance_id="project-instance",
+        mutation_request_id=HEX_A, result_digest=HEX_B,
+    )
 
 
 async def test_disposition_routes_project_closed_results(aiohttp_client, app, user_manager):
     class Provider:
         matches = Mock(return_value=False)
         execute = AsyncMock()
+        read_userdata_workflow = AsyncMock()
 
         async def get_userdata_mutation_disposition(self, **kwargs):
             return write_result()
@@ -900,17 +953,18 @@ async def test_disposition_routes_project_closed_results(aiohttp_client, app, us
     client = await aiohttp_client(app)
 
     fetched = await client.get(
-        f"/userdata/mutation-disposition/{HEX_A}?project_instance_id=project-instance"
+        f"/userdata/mutation-disposition/{HEX_A}?project_instance_id=project-instance&project_path=%2Fprojects%2Fa"
     )
     listed = await client.get(
-        "/userdata/mutation-dispositions?project_instance_id=project-instance"
+        "/userdata/mutation-dispositions?project_instance_id=project-instance&project_path=%2Fprojects%2Fa"
     )
     identities = await client.get(
-        "/userdata/workflow-identities?project_instance_id=project-instance"
+        "/userdata/workflow-identities?project_instance_id=project-instance&project_path=%2Fprojects%2Fa"
     )
     acknowledged = await client.delete(
         f"/userdata/mutation-disposition/{HEX_A}",
         json={
+            "project_path": "/projects/a",
             "project_instance_id": "project-instance",
             "mutation_request_id": HEX_A,
             "result_digest": HEX_B,
@@ -1086,9 +1140,9 @@ async def test_identity_inventory_provider_preserves_unavailable_member(user_man
     provider.list_userdata_workflow_identities.return_value = deepcopy(original)
     remove = user_manager.add_userdata_mutation_transaction_provider(provider)
     try:
-        result = await user_manager.list_userdata_workflow_identities("project-instance")
+        result = await user_manager.list_userdata_workflow_identities("project-instance", project_path="/projects/a")
         provider.list_userdata_workflow_identities.assert_awaited_once_with(
-            project_instance_id="project-instance"
+            project_path="/projects/a", project_instance_id="project-instance"
         )
         assert result == original
         assert _validate_workflow_identity_inventory(result, "project-instance") == original
@@ -1096,7 +1150,7 @@ async def test_identity_inventory_provider_preserves_unavailable_member(user_man
     finally:
         remove()
     with pytest.raises(RuntimeError, match="provider unavailable"):
-        await user_manager.list_userdata_workflow_identities("project-instance")
+        await user_manager.list_userdata_workflow_identities("project-instance", project_path="/projects/a")
 
 
 @pytest.mark.parametrize("storage_key", ["example.json", None])
@@ -1196,7 +1250,9 @@ async def test_identity_inventory_refuses_conflicting_or_fabricated_content_evid
 
 
 @pytest_asyncio.fixture
-async def exact_pm_project_instance_routes(tmp_path, user_manager, monkeypatch):
+async def pm_original_folder_routes(tmp_path, user_manager, monkeypatch):
+    # The fixture consumes real PM/cache owners without registering host runtime routes.
+    monkeypatch.setenv("ALCHEM_WORKBENCH_WORKER", "1")
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "custom_nodes"))
     from ALCHEM_project_manager.adapters.comfyui_userdata_hook import (
         ComfyUIUserdataHookAdapter,
@@ -1211,10 +1267,15 @@ async def exact_pm_project_instance_routes(tmp_path, user_manager, monkeypatch):
         metadata_registry_root=tmp_path / "registry",
     )
     target_root = Path(manager.create_project("target-project", tmp_path)["project_path"])
+    manager.open_project(target_root, emit_event=False)
     engine = WorkflowEngine(project_manager=manager)
     target_instance_id = manager.get_context_snapshot()["project_instance_id"]
     lifecycle = engine.publish_active_workflow_lifecycle({
         "project_instance_id": target_instance_id,
+        "expected_context": {key: manager.get_context_snapshot()[key] for key in (
+            "project_id", "context_kind", "job_id", "context_revision", "project_path", "switched_at",
+        )},
+        "workflow_name": "Root userdata test",
         "host_workflow_instance_id": "root-user-manager-test-host",
         "lifecycle_correlation_id": "root-user-manager-test-create",
         "lifecycle_kind": "create",
@@ -1228,6 +1289,8 @@ async def exact_pm_project_instance_routes(tmp_path, user_manager, monkeypatch):
         raw_body=WORKFLOW_BODY,
         mutation_request_id=HEX_A,
         project_instance_id=target_instance_id,
+        project_path=str(target_root),
+        context_revision=manager.get_context_snapshot()["context_revision"],
         workflow_id=lifecycle["workflow_id"],
         expected_workflow_revision=lifecycle["workflow_revision"],
         expected_before_fingerprint=None,
@@ -1239,33 +1302,32 @@ async def exact_pm_project_instance_routes(tmp_path, user_manager, monkeypatch):
     stale_root = Path(
         manager.create_project("unrelated-stale-project", tmp_path)["project_path"]
     )
-    stale_instance_id = manager.get_context_snapshot()["project_instance_id"]
-    manager.open_project(target_root, emit_event=False)
+    stale_instance_id = manager.metadata_manager.ensure_metadata(stale_root)["project_instance_id"]
     (stale_root / ".alchem" / "metadata.json").unlink()
 
     adapter = ComfyUIUserdataHookAdapter()
     adapter.bind_workflow_mutation_transaction_provider(user_manager, engine)
     try:
-        yield target_instance_id, stale_instance_id, created
+        yield target_instance_id, stale_instance_id, created, target_root, stale_root
     finally:
         adapter.clear_runtime_bindings()
 
 
-async def test_disposition_routes_exact_pm_resolver_ignores_unrelated_stale_registry(
-    aiohttp_client, app, exact_pm_project_instance_routes
+async def test_original_folder_pm_results_ignore_unrelated_missing_metadata(
+    aiohttp_client, app, pm_original_folder_routes
 ):
-    target_instance_id, _stale_instance_id, created = exact_pm_project_instance_routes
+    target_instance_id, _stale_instance_id, created, target_root, _stale_root = pm_original_folder_routes
     client = await aiohttp_client(app)
 
     identities = await client.get(
-        f"/userdata/workflow-identities?project_instance_id={target_instance_id}"
+        f"/userdata/workflow-identities?project_instance_id={target_instance_id}&project_path={target_root}"
     )
     fetched = await client.get(
         f"/userdata/mutation-disposition/{HEX_A}"
-        f"?project_instance_id={target_instance_id}"
+        f"?project_instance_id={target_instance_id}&project_path={target_root}"
     )
     listed = await client.get(
-        f"/userdata/mutation-dispositions?project_instance_id={target_instance_id}"
+        f"/userdata/mutation-dispositions?project_instance_id={target_instance_id}&project_path={target_root}"
     )
 
     assert identities.status == fetched.status == listed.status == 200
@@ -1279,15 +1341,15 @@ async def test_disposition_routes_exact_pm_resolver_ignores_unrelated_stale_regi
     }
 
 
-async def test_disposition_routes_exact_pm_resolver_rejects_requested_stale_registry(
-    aiohttp_client, app, exact_pm_project_instance_routes
+async def test_original_folder_pm_results_reject_requested_missing_metadata(
+    aiohttp_client, app, pm_original_folder_routes
 ):
-    _target_instance_id, stale_instance_id, _created = exact_pm_project_instance_routes
+    _target_instance_id, stale_instance_id, _created, _target_root, stale_root = pm_original_folder_routes
     client = await aiohttp_client(app)
     routes = (
-        f"/userdata/workflow-identities?project_instance_id={stale_instance_id}",
-        f"/userdata/mutation-disposition/{HEX_B}?project_instance_id={stale_instance_id}",
-        f"/userdata/mutation-dispositions?project_instance_id={stale_instance_id}",
+        f"/userdata/workflow-identities?project_instance_id={stale_instance_id}&project_path={stale_root}",
+        f"/userdata/mutation-disposition/{HEX_B}?project_instance_id={stale_instance_id}&project_path={stale_root}",
+        f"/userdata/mutation-dispositions?project_instance_id={stale_instance_id}&project_path={stale_root}",
     )
 
     for route in routes:
@@ -1331,7 +1393,7 @@ async def test_get_disposition_rejects_mismatched_result_correlation(
     for _ in range(4):
         response = await client.get(
             f"/userdata/mutation-disposition/{HEX_A}"
-            "?project_instance_id=project-instance"
+            "?project_instance_id=project-instance&project_path=%2Fprojects%2Fa"
         )
         assert response.status == 500
         assert (await response.json())["reason"] == (
@@ -1359,7 +1421,7 @@ async def test_list_dispositions_rejects_mismatched_result_correlation(
     for _ in range(2):
         response = await client.get(
             "/userdata/mutation-dispositions"
-            "?project_instance_id=project-instance"
+            "?project_instance_id=project-instance&project_path=%2Fprojects%2Fa"
         )
         assert response.status == 500
 
@@ -1374,6 +1436,7 @@ async def test_ack_path_body_mismatch_rejects_before_provider(
     resp = await client.delete(
         f"/userdata/mutation-disposition/{HEX_A}",
         json={
+            "project_path": "/projects/a",
             "project_instance_id": "project-instance",
             "mutation_request_id": HEX_C,
             "result_digest": HEX_B,
@@ -1405,6 +1468,7 @@ async def test_ack_disposition_rejects_mismatched_provider_correlation(
     user_manager.add_userdata_mutation_transaction_provider(provider)
     client = await aiohttp_client(app)
     body = {
+        "project_path": "/projects/a",
         "project_instance_id": "project-instance",
         "mutation_request_id": HEX_A,
         "result_digest": HEX_B,
@@ -1438,7 +1502,7 @@ async def test_provider_owned_project_context_unavailable_passes_exactly(
     client = await aiohttp_client(app)
 
     response = await client.get(
-        f"{route}?project_instance_id=project-instance"
+        f"{route}?project_instance_id=project-instance&project_path=%2Fprojects%2Fa"
     )
 
     assert response.status == 503
@@ -1462,6 +1526,7 @@ async def test_ack_provider_owned_project_context_unavailable_passes_exactly(
     response = await client.delete(
         f"/userdata/mutation-disposition/{HEX_A}",
         json={
+            "project_path": "/projects/a",
             "project_instance_id": "project-instance",
             "mutation_request_id": HEX_A,
             "result_digest": HEX_B,
@@ -1479,7 +1544,7 @@ async def test_invalid_logical_key_rejects_before_provider(
     user_manager.add_userdata_mutation_transaction_provider(provider)
     client = await aiohttp_client(app)
 
-    resp = await client.post("/userdata/workflows%255Cexample.json", data=b"payload")
+    resp = await client.post("/userdata/workflows%255Cexample.json?project_path=%2Fprojects%2Fa&context_revision=4", data=b"payload")
 
     assert resp.status == 400
     assert await resp.json() == {
@@ -1627,3 +1692,133 @@ async def test_listuserdata_v2_url_encoded_path(aiohttp_client, app, tmp_path):
     assert entry["name"] == "file.txt"
     # Ensure the path is correctly decoded and uses forward slash
     assert entry["path"] == "my dir/file.txt"
+
+
+@pytest.mark.parametrize("method,path,headers,body", [
+    ("POST", "/userdata/workflows%252Fexample.json?write_mode=replace", REPLACE_HEADERS, WORKFLOW_BODY),
+    ("DELETE", "/userdata/workflows%252Fa.json", DELETE_HEADERS, b""),
+    ("POST", "/userdata/workflows%252Fa.json/move/workflows%252Fb.json", MOVE_HEADERS, b""),
+])
+async def test_original_folder_mutation_rejects_id_only_dispatch(
+    aiohttp_client, app, user_manager, method, path, headers, body,
+):
+    provider = MutationProvider(result=write_result())
+    user_manager.add_userdata_mutation_transaction_provider(provider)
+    client = await aiohttp_client(app)
+    response = await client.request(method, path, headers=headers, data=body)
+    assert response.status == 400
+    provider.execute.assert_not_awaited()
+
+
+async def test_original_folder_mutation_forwards_captured_folder_revision_and_bytes(
+    aiohttp_client, app, user_manager,
+):
+    provider = MutationProvider(result=write_result())
+    user_manager.add_userdata_mutation_transaction_provider(provider)
+    client = await aiohttp_client(app)
+    response = await client.post(
+        "/userdata/workflows%252Fexample.json?write_mode=replace&project_path=%2Fprojects%2F%E5%8E%9F%E7%9B%AE%E5%BD%95&context_revision=7",
+        data=WORKFLOW_BODY, headers=REPLACE_HEADERS,
+    )
+    assert response.status == 200
+    assert await response.json() == write_result()
+    actual = provider.execute.await_args.kwargs
+    assert actual["project_path"] == "/projects/原目录"
+    assert actual["context_revision"] == 7
+    assert actual["raw_body"] == WORKFLOW_BODY
+
+
+@pytest.mark.parametrize("query", [
+    "project_instance_id=project-instance",
+    "project_instance_id=project-instance&project_path=",
+    "project_instance_id=project-instance&project_path=%2Fa&project_path=%2Fb",
+    "project_instance_id=project-instance&project_instance_id=other&project_path=%2Fa",
+])
+@pytest.mark.parametrize("route", [
+    f"/userdata/mutation-disposition/{HEX_A}",
+    "/userdata/mutation-dispositions",
+    "/userdata/workflow-identities",
+])
+async def test_original_folder_result_routes_reject_missing_or_duplicate_scope(
+    aiohttp_client, app, user_manager, route, query,
+):
+    provider = MutationProvider(result=write_result())
+    user_manager.add_userdata_mutation_transaction_provider(provider)
+    client = await aiohttp_client(app)
+    response = await client.get(f"{route}?{query}")
+    assert response.status == 400
+    provider.get_userdata_mutation_disposition.assert_not_awaited()
+    provider.list_userdata_mutation_dispositions.assert_not_awaited()
+    provider.list_userdata_workflow_identities.assert_not_awaited()
+
+
+async def test_original_folder_reread_preserves_bytes_and_avoids_current_userdata(
+    aiohttp_client, app, user_manager,
+):
+    provider = MutationProvider()
+    raw = b'{"nodes": [], "value": "original"}\n'
+    provider.read_userdata_workflow.return_value = raw
+    user_manager.add_userdata_mutation_transaction_provider(provider)
+    user_manager.get_request_user_filepath = Mock(side_effect=AssertionError("current root must not be used"))
+    client = await aiohttp_client(app)
+    response = await client.get(
+        "/userdata/workflows%252Fexample.json?project_path=%2Fprojects%2Fa&project_instance_id=project-instance"
+    )
+    assert response.status == 200
+    assert await response.read() == raw
+    provider.read_userdata_workflow.assert_awaited_once_with(
+        project_path="/projects/a", project_instance_id="project-instance", storage_key="example.json",
+    )
+    user_manager.get_request_user_filepath.assert_not_called()
+
+
+@pytest.mark.parametrize("query", [
+    "project_path=%2Fa&context_revision=01",
+    "project_path=%2Fa&context_revision=-1",
+    "project_path=%2Fa&context_revision=1.0",
+    "project_path=%2Fa&context_revision=",
+    "project_path=%2Fa&context_revision=1&context_revision=2",
+    "project_path=%2Fa&project_path=%2Fb&context_revision=1",
+    "project_path=relative&context_revision=1",
+    "project_path=%00&context_revision=1",
+])
+async def test_original_folder_mutation_rejects_ambiguous_or_invalid_context(
+    aiohttp_client, app, user_manager, query,
+):
+    provider = MutationProvider(result=write_result())
+    user_manager.add_userdata_mutation_transaction_provider(provider)
+    client = await aiohttp_client(app)
+    response = await client.post(
+        f"/userdata/workflows%252Fexample.json?write_mode=replace&{query}",
+        data=WORKFLOW_BODY, headers=REPLACE_HEADERS,
+    )
+    assert response.status == 400
+    provider.execute.assert_not_awaited()
+
+
+async def test_original_folder_ack_rejects_id_only_body(aiohttp_client, app, user_manager):
+    provider = MutationProvider()
+    user_manager.add_userdata_mutation_transaction_provider(provider)
+    client = await aiohttp_client(app)
+    response = await client.delete(
+        f"/userdata/mutation-disposition/{HEX_A}",
+        json={"project_instance_id": "project-instance", "mutation_request_id": HEX_A, "result_digest": HEX_B},
+    )
+    assert response.status == 400
+    provider.acknowledge_userdata_mutation_disposition.assert_not_awaited()
+
+
+@pytest.mark.parametrize("error,status", [(FileNotFoundError(), 404), (PermissionError(), 403), (RuntimeError("foreign ledger"), 503)])
+async def test_original_folder_reread_preserves_true_failure_without_fallback(
+    aiohttp_client, app, user_manager, error, status,
+):
+    provider = MutationProvider()
+    provider.read_userdata_workflow.side_effect = error
+    user_manager.add_userdata_mutation_transaction_provider(provider)
+    user_manager.get_request_user_filepath = Mock(side_effect=AssertionError("current root must not be used"))
+    client = await aiohttp_client(app)
+    response = await client.get(
+        "/userdata/workflows%252Fexample.json?project_path=%2Fprojects%2Fa&project_instance_id=project-instance"
+    )
+    assert response.status == status
+    user_manager.get_request_user_filepath.assert_not_called()
