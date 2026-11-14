@@ -2,6 +2,7 @@ import pytest
 import pytest_asyncio
 import hashlib
 import os
+from copy import deepcopy
 from pathlib import Path
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -1014,6 +1015,183 @@ async def test_identity_inventory_rejects_invalid_identity_tuple(field, value):
     }
     assert _validate_workflow_identity_inventory(
         result, "project-instance"
+    ) is None
+
+
+def _identity_inventory_member(*, storage_key="example.json", unavailable=False):
+    identity = {
+        "workflow_id": HEX_C,
+        "workflow_filename": "alpha",
+        "workflow_storage_key": storage_key,
+        "workflow_revision": 3,
+        "workflow_generation": 2,
+        "host_workflow_instance_id": "host-workflow-instance",
+    }
+    if unavailable:
+        identity["unavailable_reason"] = "Active workflow file contains invalid JSON"
+    elif storage_key is not None:
+        identity["workflow_fingerprint"] = HEX_B
+    return identity
+
+
+def _identity_inventory(*identities):
+    return {
+        "schema_id": "pm.workbench-workflow-identity-inventory.v2",
+        "project_instance_id": "project-instance",
+        "ledger_revision": 4,
+        "identities": list(identities),
+    }
+
+
+@pytest.mark.parametrize("storage_key", ["example.json", None])
+@pytest.mark.parametrize("unavailable", [False, True])
+async def test_identity_inventory_preserves_authenticated_content_availability(
+    storage_key, unavailable,
+):
+    result = _identity_inventory(_identity_inventory_member(
+        storage_key=storage_key, unavailable=unavailable,
+    ))
+    original = deepcopy(result)
+
+    assert _validate_workflow_identity_inventory(result, "project-instance") == original
+    assert result == original
+
+
+async def test_identity_inventory_keeps_complete_mixed_membership_in_original_order():
+    rows = [
+        _identity_inventory_member(),
+        _identity_inventory_member(unavailable=True),
+        _identity_inventory_member(storage_key=None),
+        _identity_inventory_member(storage_key=None, unavailable=True),
+    ]
+    for number, row in enumerate(rows):
+        row.update(workflow_id=str(number) * 64,
+                   workflow_filename=f"workflow-{number}",
+                   host_workflow_instance_id=f"host-{number}")
+        if row["workflow_storage_key"] is not None:
+            row["workflow_storage_key"] = f"workflow-{number}.json"
+    result = _identity_inventory(*rows)
+    original = deepcopy(result)
+
+    assert _validate_workflow_identity_inventory(result, "project-instance") == original
+    assert result == original
+    assert [row["workflow_filename"] for row in result["identities"]] == [
+        "workflow-0", "workflow-1", "workflow-2", "workflow-3",
+    ]
+
+
+async def test_identity_inventory_provider_preserves_unavailable_member(user_manager):
+    original = _identity_inventory(_identity_inventory_member(unavailable=True))
+    provider = MutationProvider()
+    provider.list_userdata_workflow_identities.return_value = deepcopy(original)
+    remove = user_manager.add_userdata_mutation_transaction_provider(provider)
+    try:
+        result = await user_manager.list_userdata_workflow_identities("project-instance")
+        provider.list_userdata_workflow_identities.assert_awaited_once_with(
+            project_instance_id="project-instance"
+        )
+        assert result == original
+        assert _validate_workflow_identity_inventory(result, "project-instance") == original
+        provider.execute.assert_not_awaited()
+    finally:
+        remove()
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        await user_manager.list_userdata_workflow_identities("project-instance")
+
+
+@pytest.mark.parametrize("storage_key", ["example.json", None])
+@pytest.mark.parametrize("reason", [None, "", " \t\n", 0, False, [], {}])
+async def test_identity_inventory_rejects_unattributable_unavailable_reason(
+    storage_key, reason,
+):
+    identity = _identity_inventory_member(storage_key=storage_key, unavailable=True)
+    identity["unavailable_reason"] = reason
+    assert _validate_workflow_identity_inventory(
+        _identity_inventory(identity), "project-instance"
+    ) is None
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+@pytest.mark.parametrize("field,value", [
+    ("workflow_id", "not-hex64"),
+    ("workflow_filename", "nested/name"),
+    ("workflow_storage_key", "../outside.json"),
+    ("workflow_storage_key", ""),
+    ("workflow_revision", 0),
+    ("workflow_revision", True),
+    ("workflow_generation", 0),
+    ("workflow_generation", True),
+    ("host_workflow_instance_id", ""),
+    ("host_workflow_instance_id", None),
+    ("unknown", "field"),
+])
+async def test_identity_inventory_keeps_identity_refusals_for_all_availability(
+    unavailable, field, value,
+):
+    identity = _identity_inventory_member(unavailable=unavailable)
+    identity[field] = value
+    assert _validate_workflow_identity_inventory(
+        _identity_inventory(identity), "project-instance"
+    ) is None
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+@pytest.mark.parametrize("case", [
+    "wrong-schema", "crossed-project", "negative-ledger", "boolean-ledger",
+    "unknown-envelope-field", "missing-identity-field", "non-mapping-row",
+    "duplicate-workflow-id", "duplicate-filename", "unsorted-filenames",
+    "duplicate-storage-key",
+])
+async def test_identity_inventory_keeps_closed_scope_order_and_uniqueness(
+    unavailable, case,
+):
+    first = _identity_inventory_member(unavailable=unavailable)
+    result = _identity_inventory(first)
+    if case == "wrong-schema":
+        result["schema_id"] = "different-schema"
+    elif case == "crossed-project":
+        result["project_instance_id"] = "other-project"
+    elif case == "negative-ledger":
+        result["ledger_revision"] = -1
+    elif case == "boolean-ledger":
+        result["ledger_revision"] = True
+    elif case == "unknown-envelope-field":
+        result["unknown"] = "field"
+    elif case == "missing-identity-field":
+        del first["workflow_generation"]
+    elif case == "non-mapping-row":
+        result["identities"] = [None]
+    else:
+        second = {**first, "workflow_id": HEX_A, "workflow_filename": "zeta",
+                  "workflow_storage_key": "zeta.json"}
+        if case == "duplicate-workflow-id":
+            second["workflow_id"] = first["workflow_id"]
+        elif case == "duplicate-filename":
+            second["workflow_filename"] = first["workflow_filename"]
+        elif case == "unsorted-filenames":
+            first["workflow_filename"] = "zeta"
+            second["workflow_filename"] = "alpha"
+        elif case == "duplicate-storage-key":
+            second["workflow_storage_key"] = first["workflow_storage_key"]
+        result["identities"].append(second)
+    assert _validate_workflow_identity_inventory(result, "project-instance") is None
+
+
+@pytest.mark.parametrize("case", [
+    "missing-bound-evidence", "unavailable-with-fingerprint",
+    "unbound-with-fingerprint", "unbound-unavailable-with-fingerprint",
+])
+async def test_identity_inventory_refuses_conflicting_or_fabricated_content_evidence(case):
+    identity = _identity_inventory_member(
+        storage_key=None if case.startswith("unbound") else "example.json",
+        unavailable="unavailable" in case,
+    )
+    if case == "missing-bound-evidence":
+        del identity["workflow_fingerprint"]
+    else:
+        identity["workflow_fingerprint"] = HEX_B
+    assert _validate_workflow_identity_inventory(
+        _identity_inventory(identity), "project-instance"
     ) is None
 
 

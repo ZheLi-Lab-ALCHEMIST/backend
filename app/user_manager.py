@@ -610,7 +610,10 @@ def _validate_workflow_identity_inventory(result, project_instance_id):
             "workflow_revision", "workflow_generation",
             "host_workflow_instance_id",
         }
-        if storage_key is not None:
+        unavailable = "unavailable_reason" in identity
+        if unavailable:
+            expected_fields.add("unavailable_reason")
+        elif storage_key is not None:
             expected_fields.add("workflow_fingerprint")
         if (
             set(identity) != expected_fields
@@ -623,11 +626,17 @@ def _validate_workflow_identity_inventory(result, project_instance_id):
             or not isinstance(identity.get("host_workflow_instance_id"), str)
             or not identity["host_workflow_instance_id"]
             or (
-                storage_key is not None
+                unavailable
                 and (
-                    not _valid_workflow_storage_key(storage_key)
-                    or not _valid_hex64(identity.get("workflow_fingerprint"))
+                    not isinstance(identity["unavailable_reason"], str)
+                    or not identity["unavailable_reason"].strip()
                 )
+            )
+            or (storage_key is not None and not _valid_workflow_storage_key(storage_key))
+            or (
+                storage_key is not None
+                and not unavailable
+                and not _valid_hex64(identity.get("workflow_fingerprint"))
             )
         ):
             return None
