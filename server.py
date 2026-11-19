@@ -4,6 +4,7 @@ import asyncio
 import traceback
 import copy
 import inspect
+from threading import Lock
 
 import nodes
 import folder_paths
@@ -230,6 +231,7 @@ class PromptServer():
         self.sockets = dict()
         self.sockets_metadata = dict()
         self._socket_session_lock = asyncio.Lock()
+        self._socket_generation_lock = Lock()
         self._socket_generation_counter = 0
         self._socket_sessions: Dict[str, Dict[str, Any]] = {}
         self._socket_message_handlers: Dict[str, Callable[..., Awaitable[None]]] = {}
@@ -881,89 +883,80 @@ class PromptServer():
 
     async def get_current_socket_generation(self, sid):
         async with self._socket_session_lock:
-            record = self._socket_sessions.get(sid)
-            if record is None or record["revoked"]:
-                return None
-            return record["generation"]
+            with self._socket_generation_lock:
+                record = self._socket_sessions.get(sid)
+                if record is None or record["revoked"]:
+                    return None
+                return record["generation"]
+
+    def _current_socket_session_locked(self, sid, generation, socket_object):
+        record = self._socket_sessions.get(sid)
+        if (
+            record is not None
+            and record["generation"] == generation
+            and record["socket"] is socket_object
+            and not record["revoked"]
+        ):
+            return record
+        return None
 
     async def try_begin_generation_bound_side_effect(
         self, sid, generation, socket_object, abort_token, transition_owner,
     ):
         async with self._socket_session_lock:
-            record = self._socket_sessions.get(sid)
-            generation_current = (
-                record is not None
-                and record["generation"] == generation
-                and record["socket"] is socket_object
-                and not record["revoked"]
-            )
-            return transition_owner.try_begin(
-                generation_current,
-                abort_observed=abort_token.aborted,
-            )
+            with self._socket_generation_lock:
+                current = self._current_socket_session_locked(sid, generation, socket_object)
+                return transition_owner.try_begin(
+                    current is not None,
+                    abort_observed=abort_token.aborted,
+                )
 
-    async def try_publish_generation_bound_terminal(
+    def try_publish_generation_bound_terminal(
         self, sid, generation, socket_object, abort_token, transition_owner,
     ):
-        async with self._socket_session_lock:
-            record = self._socket_sessions.get(sid)
-            generation_current = (
-                record is not None
-                and record["generation"] == generation
-                and record["socket"] is socket_object
-                and not record["revoked"]
-            )
+        # The admitted worker already holds its authority guards. Only the
+        # exact generation comparison and lease transition belong here.
+        with self._socket_generation_lock:
+            current = self._current_socket_session_locked(sid, generation, socket_object)
             return transition_owner.publish_terminal(
-                generation_current,
+                current is not None,
                 abort_observed=abort_token.aborted,
             )
 
+    def _revoke_socket_generation(self, sid, generation, socket_object):
+        with self._socket_generation_lock:
+            record = self._current_socket_session_locked(sid, generation, socket_object)
+            if record is None:
+                return False
+            record["revoked"] = True
+            self._socket_sessions.pop(sid, None)
+            if self.sockets.get(sid) is socket_object:
+                self.sockets.pop(sid, None)
+                self.sockets_metadata.pop(sid, None)
+            return True
+
     async def send_json_exact(self, sid, generation, socket_object, event, data, timeout=5.0):
-        closed = False
         async with self._socket_session_lock:
-            record = self._socket_sessions.get(sid)
-            if (
-                record is None
-                or record["generation"] != generation
-                or record["socket"] is not socket_object
-                or record["revoked"]
-            ):
-                return "replaced"
+            with self._socket_generation_lock:
+                if self._current_socket_session_locked(sid, generation, socket_object) is None:
+                    return "replaced"
             try:
                 await asyncio.wait_for(
                     socket_object.send_json({"type": event, "data": data}),
                     timeout=timeout,
                 )
             except Exception:
-                record["revoked"] = True
-                self._socket_sessions.pop(sid, None)
-                if self.sockets.get(sid) is socket_object:
-                    self.sockets.pop(sid, None)
-                    self.sockets_metadata.pop(sid, None)
-                closed = True
+                self._revoke_socket_generation(sid, generation, socket_object)
             else:
                 return "delivered"
-        if closed:
-            if not socket_object.closed:
-                await socket_object.close()
-            self._publish_socket_lifecycle("disconnected", sid, generation)
+        if not socket_object.closed:
+            await socket_object.close()
+        self._publish_socket_lifecycle("disconnected", sid, generation)
         return "closed"
 
     async def close_socket_generation(self, sid, generation, socket_object):
-        removed = False
         async with self._socket_session_lock:
-            record = self._socket_sessions.get(sid)
-            if (
-                record is not None
-                and record["generation"] == generation
-                and record["socket"] is socket_object
-            ):
-                record["revoked"] = True
-                self._socket_sessions.pop(sid, None)
-                if self.sockets.get(sid) is socket_object:
-                    self.sockets.pop(sid, None)
-                    self.sockets_metadata.pop(sid, None)
-                removed = True
+            removed = self._revoke_socket_generation(sid, generation, socket_object)
         if not socket_object.closed:
             await socket_object.close()
         if removed:
@@ -973,23 +966,24 @@ class PromptServer():
     async def _install_socket_generation(self, sid, socket_object):
         replaced = None
         async with self._socket_session_lock:
-            previous = self._socket_sessions.get(sid)
-            if previous is not None:
-                previous["revoked"] = True
-                replaced = (previous["generation"], previous["socket"])
-            self._socket_generation_counter += 1
-            generation = self._socket_generation_counter
-            self._socket_sessions[sid] = {
-                "generation": generation,
-                "socket": socket_object,
-                "revoked": False,
-                "feature_flags_set": False,
-            }
-            self.sockets[sid] = socket_object
-            self.sockets_metadata[sid] = {
-                "feature_flags": {},
-                "socket_generation": generation,
-            }
+            with self._socket_generation_lock:
+                previous = self._socket_sessions.get(sid)
+                if previous is not None:
+                    previous["revoked"] = True
+                    replaced = (previous["generation"], previous["socket"])
+                self._socket_generation_counter += 1
+                generation = self._socket_generation_counter
+                self._socket_sessions[sid] = {
+                    "generation": generation,
+                    "socket": socket_object,
+                    "revoked": False,
+                    "feature_flags_set": False,
+                }
+                self.sockets[sid] = socket_object
+                self.sockets_metadata[sid] = {
+                    "feature_flags": {},
+                    "socket_generation": generation,
+                }
         if replaced is not None:
             replaced_generation, replaced_socket = replaced
             if not replaced_socket.closed:
@@ -999,20 +993,8 @@ class PromptServer():
         return generation
 
     async def _remove_socket_generation(self, sid, generation, socket_object):
-        removed = False
         async with self._socket_session_lock:
-            record = self._socket_sessions.get(sid)
-            if (
-                record is not None
-                and record["generation"] == generation
-                and record["socket"] is socket_object
-            ):
-                record["revoked"] = True
-                self._socket_sessions.pop(sid, None)
-                if self.sockets.get(sid) is socket_object:
-                    self.sockets.pop(sid, None)
-                    self.sockets_metadata.pop(sid, None)
-                removed = True
+            removed = self._revoke_socket_generation(sid, generation, socket_object)
         if removed:
             self._publish_socket_lifecycle("disconnected", sid, generation)
 
@@ -1029,23 +1011,17 @@ class PromptServer():
             return False
         feature_flags_settled_now = False
         async with self._socket_session_lock:
-            record = self._socket_sessions.get(sid)
-            if (
-                record is None
-                or record["generation"] != generation
-                or record["socket"] is not socket_object
-                or record["revoked"]
-            ):
-                return False
-            if not record["feature_flags_set"]:
-                if message_type != "feature_flags":
+            with self._socket_generation_lock:
+                record = self._current_socket_session_locked(sid, generation, socket_object)
+                if record is None:
                     return False
-                record["feature_flags_set"] = True
-                self.sockets_metadata[sid]["feature_flags"] = dict(data)
-                feature_flags_settled_now = True
-                handler = None
-            else:
-                handler = self._socket_message_handlers.get(message_type)
+                if not record["feature_flags_set"]:
+                    if message_type != "feature_flags":
+                        return False
+                    record["feature_flags_set"] = True
+                    self.sockets_metadata[sid]["feature_flags"] = dict(data)
+                    feature_flags_settled_now = True
+            handler = None if feature_flags_settled_now else self._socket_message_handlers.get(message_type)
         if message_type == "feature_flags":
             if not feature_flags_settled_now:
                 return False
