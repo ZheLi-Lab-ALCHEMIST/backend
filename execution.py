@@ -777,6 +777,14 @@ class PromptExecutor:
                 "outputs": ui_outputs,
                 "meta": meta_outputs,
             }
+            if sidecar is not None:
+                workflow = sidecar.context["workflow"]
+                self.history_result["workbench_execution"] = {
+                    "project_instance_id": workflow["project_instance_id"],
+                    "context_revision": workflow["context_revision"],
+                    "workflow_id": workflow["workflow_id"],
+                    "executed_node_ids": sorted(executed),
+                }
             self.server.last_node_id = None
             if comfy.model_management.DISABLE_SMART_MEMORY:
                 comfy.model_management.unload_all_models()
