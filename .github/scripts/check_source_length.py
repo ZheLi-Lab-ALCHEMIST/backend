@@ -119,7 +119,7 @@ def baseline_limits(seed, baseline, release_push):
             try:
                 recorded = load_manifest(git("show", f"{revision}:{MANIFEST}"))
             except ValueError as error:
-                print(f"Ignoring invalid manifest at {revision}: {error}", file=sys.stderr)
+                sys.stderr.write(f"Ignoring invalid manifest at {revision}: {error}\n")
             else:
                 reductions = {path: recorded.get(path, LIMIT) for path, count in limits.items()
                               if recorded.get(path, LIMIT) < count}
@@ -156,7 +156,7 @@ def check(actual, recorded, limits):
         elif recorded.get(path) != count:
             errors.append(f"{path!r}: {MANIFEST} must record exactly {count} lines")
     for error in errors:
-        print(error, file=sys.stderr)
+        sys.stderr.write(f"{error}\n")
     return bool(errors)
 
 
@@ -180,7 +180,7 @@ def main():
         baseline = git("rev-parse", "--verify", "--end-of-options", f"{args.baseline}^{{commit}}").decode().strip()
         if check(actual, recorded, baseline_limits(args.seed, baseline, args.release_push)):
             return 1
-    print(f"Source length: {len(counts)} tracked files, {len(actual)} above {LIMIT:,} lines")
+    sys.stdout.write(f"Source length: {len(counts)} tracked files, {len(actual)} above {LIMIT:,} lines\n")
     return 0
 
 
@@ -188,5 +188,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
-        print(f"Source length check failed: {exc}", file=sys.stderr)
+        sys.stderr.write(f"Source length check failed: {exc}\n")
         raise SystemExit(1) from None
