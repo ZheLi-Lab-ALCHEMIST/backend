@@ -1,0 +1,73 @@
+name: Tracked source length
+
+'on':
+  push:
+    branches: ['**']
+
+permissions:
+  contents: read
+
+jobs:
+  source-length:
+    if: ${{ !github.event.deleted }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    defaults:
+      run:
+        shell: bash
+    env:
+      RELEASE_BRANCH: master
+      SOURCE_LENGTH_SEED: b794fd44e9acf9e8a17d9a7101ce3cba02b520f4
+    steps:
+      - name: Allocate private checkout
+        id: allocation
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          root=$(mktemp -d "$GITHUB_WORKSPACE/.alchem-source-length.XXXXXXXX")
+          stat -c '%d:%i' "$root" > "$root/.allocation"
+          printf 'path=%s\n' "${root##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out this push and its release history
+        timeout-minutes: 5
+        env:
+          JOB_PATH: ${{ steps.allocation.outputs.path }}
+        run: |
+          set -euo pipefail
+          # This public fork tracks a frontend gitlink without a submodule URL.
+          # Use Git directly so checkout credential cleanup never walks it.
+          checkout="$GITHUB_WORKSPACE/$JOB_PATH/checkout"
+          git init -q "$checkout"
+          git -C "$checkout" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          timeout -k 5s 240s git -C "$checkout" fetch --no-tags --no-recurse-submodules origin \
+            "+refs/heads/$RELEASE_BRANCH:refs/remotes/origin/$RELEASE_BRANCH" "$GITHUB_SHA"
+          git -C "$checkout" checkout --detach --no-recurse-submodules "$GITHUB_SHA"
+
+      - name: Check tracked source length
+        timeout-minutes: 2
+        working-directory: ${{ steps.allocation.outputs.path }}/checkout
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          comparison=(--baseline "refs/remotes/origin/$RELEASE_BRANCH")
+          if [[ "$GITHUB_REF" == "refs/heads/$RELEASE_BRANCH" ]]; then
+            comparison=(--baseline "$PUSH_BEFORE" --release-push)
+          fi
+          timeout -k 5s 75s python3 .github/scripts/check_source_length.py \
+            "${comparison[@]}" --seed "$SOURCE_LENGTH_SEED"
+
+      - name: Release private checkout
+        if: ${{ always() && steps.allocation.outputs.path != '' }}
+        timeout-minutes: 1
+        env:
+          JOB_PATH: ${{ steps.allocation.outputs.path }}
+        run: |
+          set -euo pipefail
+          [[ "$JOB_PATH" =~ ^\.alchem-source-length\.[[:alnum:]]{8}$ ]]
+          root="$GITHUB_WORKSPACE/$JOB_PATH"
+          test -d "$root" && test ! -L "$root"
+          test "$(stat -c '%d:%i' "$root")" = "$(<"$root/.allocation")"
+          find -P "$root" -xdev -depth -delete
+          test ! -e "$root"
