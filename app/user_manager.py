@@ -283,34 +283,34 @@ def _mutation_headers(result):
         "X-Alchem-Workflow-Revision": str(result["workflow_revision"]),
         "X-Alchem-Workflow-Id": result["workflow_id"],
     }
+    # Match encodeURIComponent for the UTF-8 storage keys in these headers.
+    safe = "-_.!~*'()"
     operation = result["operation"]
     if operation == "write":
         headers.update({
-            "X-Alchem-Workflow-Storage-Key": result["workflow_storage_key"],
+            "X-Alchem-Workflow-Storage-Key": parse.quote(
+                result["workflow_storage_key"], safe=safe
+            ),
             "X-Alchem-Workflow-Fingerprint": result["workflow_fingerprint"],
         })
     elif operation == "delete":
         headers.update({
-            "X-Alchem-Deleted-Workflow-Storage-Key": (
-                result["deleted_workflow_storage_key"]
+            "X-Alchem-Deleted-Workflow-Storage-Key": parse.quote(
+                result["deleted_workflow_storage_key"], safe=safe
             ),
             "X-Alchem-Workflow-Absent": "true",
-            "X-Alchem-Deleted-Content-Fingerprint": (
-                result["deleted_content_fingerprint"]
-            ),
+            "X-Alchem-Deleted-Content-Fingerprint": result["deleted_content_fingerprint"],
         })
     else:
         headers.update({
-            "X-Alchem-Source-Workflow-Storage-Key": (
-                result["source_workflow_storage_key"]
+            "X-Alchem-Source-Workflow-Storage-Key": parse.quote(
+                result["source_workflow_storage_key"], safe=safe
             ),
             "X-Alchem-Source-Absent": "true",
-            "X-Alchem-Destination-Workflow-Storage-Key": (
-                result["destination_workflow_storage_key"]
+            "X-Alchem-Destination-Workflow-Storage-Key": parse.quote(
+                result["destination_workflow_storage_key"], safe=safe
             ),
-            "X-Alchem-Destination-Workflow-Fingerprint": (
-                result["destination_workflow_fingerprint"]
-            ),
+            "X-Alchem-Destination-Workflow-Fingerprint": result["destination_workflow_fingerprint"],
         })
     if uncertain:
         headers.update({
